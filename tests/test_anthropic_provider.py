@@ -135,3 +135,30 @@ async def test_anthropic_reports_final_usage() -> None:
     )
     result = [event async for event in provider.stream([ChatMessage("user", "hi")])]
     assert result[-2] == UsageReported(TokenUsage(20, 5, 25, 3, 7))
+
+
+async def test_anthropic_streams_multiple_tool_uses() -> None:
+    events = [
+        SimpleNamespace(
+            type="content_block_start",
+            index=0,
+            content_block=SimpleNamespace(type="tool_use", id="a", name="read_file", input={}),
+        ),
+        SimpleNamespace(
+            type="content_block_start",
+            index=1,
+            content_block=SimpleNamespace(type="tool_use", id="b", name="find_files", input={}),
+        ),
+        SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason="tool_use")),
+    ]
+    messages = FakeMessages(events, SimpleNamespace(content=[]))
+    provider = AnthropicProvider(
+        ProviderConfig(name="claude", protocol="anthropic", model="m", base_url="https://test", api_key="x"),
+        SimpleNamespace(messages=messages),
+    )
+    result = [event async for event in provider.stream([ChatMessage("user", "tools")])]
+    calls = [event for event in result if isinstance(event, ToolCallDelta)]
+    assert [(call.index, call.id_fragment, call.name_fragment) for call in calls] == [
+        (0, "a", "read_file"),
+        (1, "b", "find_files"),
+    ]

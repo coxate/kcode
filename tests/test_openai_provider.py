@@ -167,3 +167,33 @@ async def test_deepseek_usage_reasoning_and_continuation_round_trip() -> None:
     _ = [event async for event in provider.stream([message])]
     assert completions.request["messages"][0]["reasoning_content"] == "先读取"
     assert completions.request["stream_options"] == {"include_usage": True}
+
+
+async def test_openai_streams_multiple_tool_calls_by_index() -> None:
+    chunks = [
+        SimpleNamespace(
+            usage=None,
+            choices=[SimpleNamespace(
+                delta=SimpleNamespace(
+                    content=None,
+                    reasoning_content=None,
+                    tool_calls=[
+                        SimpleNamespace(index=0, id="a", function=SimpleNamespace(name="read_file", arguments="{}")),
+                        SimpleNamespace(index=1, id="b", function=SimpleNamespace(name="find_files", arguments="{}")),
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )],
+        )
+    ]
+    completions = FakeCompletions(FakeResponse(chunks))
+    provider = OpenAIProvider(
+        ProviderConfig(name="openai", protocol="openai", model="m", base_url="https://test", api_key="x"),
+        SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    events = [event async for event in provider.stream([ChatMessage("user", "tools")])]
+    calls = [event for event in events if isinstance(event, ToolCallDelta)]
+    assert [(call.index, call.id_fragment, call.name_fragment) for call in calls] == [
+        (0, "a", "read_file"),
+        (1, "b", "find_files"),
+    ]
