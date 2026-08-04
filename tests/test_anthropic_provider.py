@@ -94,7 +94,8 @@ async def test_anthropic_tool_fragments_and_continuation_state() -> None:
         SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason="tool_use")),
     ]
     block = SimpleNamespace(model_dump=lambda mode: {"type": "thinking", "thinking": "summary", "signature": "sig"})
-    messages = FakeMessages(events, SimpleNamespace(content=[block]))
+    redacted = SimpleNamespace(model_dump=lambda mode: {"type": "redacted_thinking", "data": "opaque"})
+    messages = FakeMessages(events, SimpleNamespace(content=[block, redacted]))
     provider = AnthropicProvider(
         ProviderConfig(name="claude", protocol="anthropic", model="m", base_url="https://test", api_key="x", thinking=True),
         SimpleNamespace(messages=messages),
@@ -107,6 +108,10 @@ async def test_anthropic_tool_fragments_and_continuation_state() -> None:
     ]
     completed = result[-1]
     assert completed.continuation_state.payload[0]["signature"] == "sig"
+    assert completed.continuation_state.payload[1] == {
+        "type": "redacted_thinking",
+        "data": "opaque",
+    }
     assert messages.request["tool_choice"] == {"type": "auto"}
 
 

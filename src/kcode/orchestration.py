@@ -23,6 +23,7 @@ from kcode.events import (
     AgentProgress,
     AgentStopped,
     AgentStopReason,
+    ApprovalPending,
     ProviderEvent,
     StreamCompleted,
     TextDelta,
@@ -300,6 +301,19 @@ class AgentRunner:
 
                 result_messages: list[ToolResultMessage] = []
                 for batch_index, batch in enumerate(self.scheduler.batches(prepared), 1):
+                    approvals = tuple(
+                        item.approval for item in batch.calls if item.approval is not None
+                    )
+                    if approvals:
+                        yield AgentProgress(
+                            mode,
+                            iteration,
+                            self.config.max_iterations,
+                            AgentPhase.APPROVAL,
+                            batch_index,
+                        )
+                        for request in approvals:
+                            yield ApprovalPending(request)
                     yield AgentProgress(
                         mode,
                         iteration,

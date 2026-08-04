@@ -67,3 +67,20 @@ async def test_scheduler_parallelizes_readers_and_serializes_side_effects(tmp_pa
     assert probe.peak == 2
     assert probe.overlap_with_side_effect is False
     assert [result.data["name"] for result in results] == ["read_a", "read_b", "write", "read_c"]
+
+
+async def test_scheduler_cancels_all_running_readers(tmp_path) -> None:
+    probe = Probe()
+    registry = ToolRegistry()
+    registry.register(make_tool("read_a", ToolEffect.READ_ONLY, probe))
+    registry.register(make_tool("read_b", ToolEffect.READ_ONLY, probe))
+    executor = ToolExecutor(registry, ToolPolicy(tmp_path))
+    context = ToolContext(tmp_path)
+    prepared = tuple(
+        executor.prepare(ToolCall(index, str(index), name, "{}"), context, AgentMode.DO)
+        for index, name in enumerate(("read_a", "read_b"))
+    )
+    cancel = asyncio.Event()
+    cancel.set()
+    results = await ToolScheduler(executor, 2).execute(prepared, context, allow, cancel)
+    assert [result.status for result in results] == ["cancelled", "cancelled"]
