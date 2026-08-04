@@ -6,6 +6,8 @@ class CommandKind(StrEnum):
     HELP = "help"
     CLEAR = "clear"
     EXIT = "exit"
+    PLAN = "plan"
+    DO = "do"
     UNKNOWN = "unknown"
 
 
@@ -24,5 +26,7 @@ def parse_command(text: str) -> Command | None:
         "help": CommandKind.HELP,
         "clear": CommandKind.CLEAR,
         "exit": CommandKind.EXIT,
+        "plan": CommandKind.PLAN,
+        "do": CommandKind.DO,
     }
     return Command(known.get(value, CommandKind.UNKNOWN), stripped)

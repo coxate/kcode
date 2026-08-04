@@ -1,8 +1,10 @@
 # KCode
 
-KCode 是一个 Python 全屏终端 AI 编程助手。它提供流式 Markdown、多轮会话、Claude extended thinking，以及 Anthropic、OpenAI 和 DeepSeek 三种配置方式。
+KCode 是一个 Python 全屏终端 AI 编程助手。它提供流式 Markdown、多轮会话、ReAct Agent Loop、Plan Mode、Claude extended thinking，以及 Anthropic、OpenAI 和 DeepSeek 三种配置方式。
 
-0.2.0 内置六个工具：读取文件、新建文件、唯一匹配修改文件、执行命令、按 glob 查找文件和按正则搜索代码。每轮最多执行一个工具；自动 Agent Loop 留在后续版本。
+0.3.0 内置六个工具：读取文件、新建文件、唯一匹配修改文件、执行命令、按 glob 查找文件和按正则搜索代码。模型可以在一次请求中连续调用多轮工具；相邻只读工具有界并发，有副作用的工具按顺序串行。
+
+每次请求默认最多运行 10 个模型轮次。模型正常完成、达到迭代上限、用户取消、连续请求未知工具或模型流出错时，界面都会显示明确的停止原因。
 
 ## 工具安全
 
@@ -38,6 +40,9 @@ export OPENAI_API_KEY="your-key"
 
 ```yaml
 active_provider: deepseek
+agent:
+  max_iterations: 10
+  max_parallel_tools: 4
 providers:
   - name: deepseek
     protocol: openai
@@ -61,11 +66,21 @@ uv run kcode
 uv run python -m kcode
 ```
 
-命令：`/help`、`/clear`、`/exit`。模型生成时按 Ctrl+C 只取消当前回答；空闲时按 Ctrl+C 退出。
+命令：`/plan`、`/do`、`/help`、`/clear`、`/exit`。模型生成时按 Ctrl+C 只取消当前任务；空闲时按 Ctrl+C 退出。
+
+## Agent Loop 与 Plan Mode
+
+- 普通启动处于 Do Mode，开放全部六个工具并沿用安全确认。
+- 输入 `/plan` 后进入只读规划模式。模型只能读取、查找、搜索，以及执行严格白名单内的只读命令。
+- 在 Plan Mode 中输入任务，KCode 会自主调查并保存最终计划。
+- 输入 `/do` 切回执行模式。保存的计划只注入下一条普通请求一次，随后自动清除。
+- 输入 `/clear` 会同时清除对话、计划并恢复 Do Mode。
+
+底部状态栏显示当前模式、模型轮次和本次请求累计 Token。供应商没有返回用量或流提前中断时显示 `Token ?`，不会把未知用量误记为零。
 
 ## 六个工具的界面验收
 
-0.2.0 每轮最多执行一个工具，因此验收时请让模型直接调用指定工具。建议在临时目录启动 KCode，并依次输入：
+基础工具验收建议在临时目录启动 KCode，并依次输入：
 
 1. `只调用 write_file，新建 acceptance-note.txt，内容为：KCode write passed`
 2. `只调用 read_file，读取 acceptance-note.txt 的第 1 到 20 行，然后概括内容`
@@ -74,7 +89,7 @@ uv run python -m kcode
 5. `只调用 find_files，在当前目录查找 *.txt`
 6. `只调用 search_code，在当前目录搜索 KCode edit passed，文件模式为 *.txt`
 
-工具卡片使用黄色边框与标题，表示本地工具动作，而不是模型的第二条回复；模型回复使用蓝色边框。卡片会列出中文参数摘要，并以绿色成功状态或红色失败状态说明实际执行结果。`write_file` 成功时会明确显示目标文件和写入字节数。
+工具卡片使用黄色边框与标题，表示本地工具动作，而不是模型的第二条回复；模型回复使用蓝色边框并标出迭代轮次。卡片会列出中文参数摘要，并以绿色成功状态或红色失败状态说明实际执行结果。`write_file` 成功时会明确显示目标文件和写入字节数。
 
 ## API Key 是否需要购买
 

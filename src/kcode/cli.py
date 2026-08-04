@@ -35,6 +35,7 @@ def main() -> int:
         cwd=cwd,
         registry=registry,
         context=context,
+        agent_config=config.agent,
     )
     app.run()
     return 0

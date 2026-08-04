@@ -93,13 +93,15 @@ class ChatMessageWidget(Vertical):
 
 
 class AssistantResponse(Vertical):
-    def __init__(self) -> None:
+    def __init__(self, iteration: int | None = None) -> None:
         super().__init__(classes="message assistant")
         self.answer_text = ""
         self.thinking_text = ""
+        self.iteration = iteration
 
     def compose(self) -> ComposeResult:
-        yield Label("KCode · 模型回复", classes="message-role")
+        suffix = f" · 第 {self.iteration} 轮" if self.iteration else ""
+        yield Label(f"KCode · 模型回复{suffix}", classes="message-role")
         with Collapsible(title="Thinking", collapsed=False, id="thinking"):
             yield Markdown(" ", id="thinking-content")
         yield Markdown(" ", id="answer-content", classes="message-content")
@@ -107,6 +109,12 @@ class AssistantResponse(Vertical):
     def update_answer(self, text: str) -> None:
         self.answer_text = text
         self.query_one("#answer-content", Markdown).update(text or " ")
+
+    def set_iteration(self, iteration: int) -> None:
+        self.iteration = iteration
+        self.query_one(".message-role", Label).update(
+            f"KCode · 模型回复 · 第 {iteration} 轮"
+        )
 
     def update_thinking(self, text: str) -> None:
         self.thinking_text = text

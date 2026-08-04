@@ -6,7 +6,15 @@ from textual.widgets import Collapsible, Input, Markdown, Static
 
 from kcode.conversation import Conversation
 from kcode.errors import ProviderError, ProviderErrorKind
-from kcode.events import StreamCompleted, TextDelta, ThinkingDelta, ToolCallDelta
+from kcode.events import (
+    StreamCompleted,
+    TextDelta,
+    ThinkingDelta,
+    TokenUsage,
+    ToolCallDelta,
+    UsageReported,
+)
+from kcode.session import AgentMode
 from kcode.ui.app import KCodeApp
 from kcode.ui.approval import ApprovalScreen
 from kcode.ui.widgets import AssistantResponse, ChatMessageWidget, ToolCallWidget
@@ -46,7 +54,7 @@ async def test_ac7_fixed_layout_at_80_by_24() -> None:
     app = KCodeApp(FakeProvider(), cwd=None)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        assert "KCode v0.2.0" in str(app.query_one("#banner", Static).content)
+        assert "KCode v0.3.0" in str(app.query_one("#banner", Static).content)
         assert app.query_one("#ready").render().plain == "Ready. Ask me anything."
         assert app.query_one("#prompt-marker", Static).content == "❯"
         assert app.query_one("#prompt", Input).placeholder == "Send a message..."
@@ -121,6 +129,40 @@ async def test_commands_are_local_and_clear_history() -> None:
         await pilot.pause()
         assert provider.requests == []
         assert conversation.snapshot() == ()
+        assert app.session.mode == AgentMode.DO
+        assert app.session.latest_plan is None
+
+
+async def test_plan_and_do_commands_update_visible_mode() -> None:
+    app = KCodeApp(FakeProvider())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await submit(app, pilot, "/plan")
+        await pilot.pause()
+        assert app.session.mode == AgentMode.PLAN
+        assert "Mode: PLAN" in app.query_one("#agent-status", Static).render().plain
+        app.session.record_plan("计划")
+        await submit(app, pilot, "/do")
+        await pilot.pause()
+        assert app.session.mode == AgentMode.DO
+        assert "Mode: DO" in app.query_one("#agent-status", Static).render().plain
+
+
+async def test_usage_and_iteration_are_shown_in_status() -> None:
+    provider = FakeProvider(
+        [
+            TextDelta("done"),
+            UsageReported(TokenUsage(7, 3, 10)),
+            StreamCompleted("stop"),
+        ]
+    )
+    app = KCodeApp(provider)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await submit(app, pilot, "统计用量")
+        await pilot.pause(0.05)
+        status = app.query_one("#agent-status", Static).render().plain
+        assert "1/10" in status
+        assert "Token 10" in status
+        assert "第 1 轮" in app.query_one(AssistantResponse).query_one(".message-role").render().plain
 
 
 async def test_openai_thinking_warning_is_shown_without_a_request() -> None:
@@ -180,8 +222,24 @@ async def test_external_write_approval_can_be_denied(tmp_path) -> None:
         await pilot.pause(0.15)
         assert not outside.exists()
         assert app.query_one(ToolCallWidget).query_one(".tool-status").render().plain.startswith("⛔ 已拒绝")
-        assert app.query_one(AssistantResponse).answer_text == "写入已被用户拒绝。"
+        assert list(app.query(AssistantResponse))[-1].answer_text == "写入已被用户拒绝。"
         assert app.conversation.snapshot()[0].assistant == "写入已被用户拒绝。"
+
+
+async def test_ctrl_c_cancels_pending_approval(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    app = KCodeApp(ToolCallingProvider(outside), cwd=workspace)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await submit(app, pilot, "在外部写文件")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, ApprovalScreen)
+        await app.action_interrupt()
+        await pilot.pause(0.15)
+        assert not outside.exists()
+        assert app.query_one("#prompt", Input).disabled is False
+        assert "Cancelled" in list(app.query(AssistantResponse))[-1].answer_text
 
 
 class SixToolProvider:
@@ -241,3 +299,41 @@ async def test_six_tools_execute_and_render_clear_success_cards(tmp_path) -> Non
             assert widget.query_one(".tool-status").render().plain.startswith("✓ 执行成功")
 
     assert (tmp_path / "acceptance-note.txt").read_text(encoding="utf-8") == "KCode edit passed"
+
+
+class ParallelReadProvider:
+    display_name = "parallel-provider"
+    model_name = "parallel-model"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools=(), tool_choice="auto"):
+        self.calls += 1
+        if self.calls == 1:
+            yield ToolCallDelta(0, "read-a", "read_file", '{"path":"a.txt"}')
+            yield ToolCallDelta(1, "read-b", "read_file", '{"path":"b.txt"}')
+            yield StreamCompleted("tool_calls")
+        else:
+            yield TextDelta("两个文件都读取完成")
+            yield UsageReported(TokenUsage(8, 4, 12))
+            yield StreamCompleted("stop")
+
+
+async def test_multi_tool_loop_renders_ordered_cards_and_new_model_step(tmp_path) -> None:
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("b", encoding="utf-8")
+    app = KCodeApp(ParallelReadProvider(), cwd=tmp_path)
+    async with app.run_test(size=(110, 40)) as pilot:
+        await submit(app, pilot, "并行读取两个文件")
+        await pilot.pause(0.2)
+        cards = list(app.query(ToolCallWidget))
+        responses = list(app.query(AssistantResponse))
+        assert [card.call.id for card in cards] == ["read-a", "read-b"]
+        assert all(
+            card.query_one(".tool-status").render().plain.startswith("✓ 执行成功")
+            for card in cards
+        )
+        assert len(responses) == 2
+        assert responses[-1].answer_text == "两个文件都读取完成"
+        assert "第 2 轮" in responses[-1].query_one(".message-role").render().plain
