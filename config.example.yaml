@@ -1,0 +1,23 @@
+active_provider: openai
+
+providers:
+  - name: openai
+    protocol: openai
+    model: gpt-5-mini
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    thinking: false
+
+  - name: anthropic
+    protocol: anthropic
+    model: claude-sonnet-4-5
+    base_url: https://api.anthropic.com
+    api_key: ${ANTHROPIC_API_KEY}
+    thinking: true
+
+  - name: deepseek
+    protocol: openai
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    thinking: false

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kcode-ai"
+version = "0.2.0"
+description = "A streaming terminal AI coding assistant with local tools"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "anthropic>=0.40,<1",
+  "openai>=2,<3",
+  "pydantic>=2,<3",
+  "pyyaml>=6,<7",
+  "textual>=8,<9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9,<10",
+  "pytest-asyncio>=1,<2",
+]
+
+[project.scripts]
+kcode = "kcode.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kcode"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
