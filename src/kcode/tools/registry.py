@@ -18,7 +18,7 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
-    def definitions(self) -> tuple[ToolDefinition, ...]:
+    def definitions(self, names: set[str] | None = None) -> tuple[ToolDefinition, ...]:
         return tuple(
             ToolDefinition(
                 tool.spec.name,
@@ -26,6 +26,7 @@ class ToolRegistry:
                 tool.spec.arguments_model.model_json_schema(),
             )
             for tool in self._tools.values()
+            if names is None or tool.spec.name in names
         )
 
     def __len__(self) -> int:

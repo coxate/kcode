@@ -10,16 +10,25 @@ from kcode.conversation import (
     AssistantMessage,
     ChatMessage,
     ConversationMessage,
+    ProviderContinuationState,
     SystemMessage,
     ToolResultMessage,
     UserMessage,
 )
 from kcode.errors import ProviderError, ProviderErrorKind
-from kcode.events import ProviderEvent, StreamCompleted, TextDelta, ToolCallDelta
+from kcode.events import (
+    ProviderEvent,
+    StreamCompleted,
+    TextDelta,
+    ThinkingDelta,
+    TokenUsage,
+    ToolCallDelta,
+    UsageReported,
+)
 from kcode.tools.base import ToolDefinition
 
 
-def _message(message: ConversationMessage) -> dict[str, Any]:
+def _message(message: ConversationMessage, *, include_reasoning: bool = False) -> dict[str, Any]:
     if isinstance(message, ChatMessage):
         return {"role": message.role, "content": message.content}
     if isinstance(message, SystemMessage):
@@ -28,6 +37,12 @@ def _message(message: ConversationMessage) -> dict[str, Any]:
         return {"role": "user", "content": message.content}
     if isinstance(message, AssistantMessage):
         value: dict[str, Any] = {"role": "assistant", "content": message.content or None}
+        if (
+            include_reasoning
+            and message.continuation_state
+            and message.continuation_state.protocol == "deepseek"
+        ):
+            value["reasoning_content"] = message.continuation_state.payload
         if message.tool_calls:
             value["tool_calls"] = [
                 {
@@ -53,6 +68,7 @@ class OpenAIProvider:
         self._client = client or openai.AsyncOpenAI(
             api_key=config.api_key.get_secret_value(), base_url=config.base_url
         )
+        self._is_deepseek = "deepseek" in config.name.lower() or "deepseek" in config.base_url.lower()
 
     @property
     def display_name(self) -> str:
@@ -70,11 +86,18 @@ class OpenAIProvider:
     ) -> AsyncIterator[ProviderEvent]:
         response: Any = None
         stop_reason: str | None = None
+        reasoning = ""
+        saw_tool_call = False
+        usage_snapshot: TokenUsage | None = None
         try:
             request: dict[str, Any] = {
                 "model": self.config.model,
-                "messages": [_message(message) for message in messages],
+                "messages": [
+                    _message(message, include_reasoning=self._is_deepseek)
+                    for message in messages
+                ],
                 "stream": True,
+                "stream_options": {"include_usage": True},
             }
             if tools:
                 request["tools"] = [
@@ -89,9 +112,21 @@ class OpenAIProvider:
                     for tool in tools
                 ]
                 request["tool_choice"] = tool_choice
-                request["parallel_tool_calls"] = False
+                request["parallel_tool_calls"] = True
             response = await self._client.chat.completions.create(**request)
             async for chunk in response:
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    details = getattr(usage, "prompt_tokens_details", None)
+                    cache_read = getattr(usage, "prompt_cache_hit_tokens", None)
+                    if cache_read is None and details is not None:
+                        cache_read = getattr(details, "cached_tokens", None)
+                    usage_snapshot = TokenUsage(
+                        input_tokens=getattr(usage, "prompt_tokens", None),
+                        output_tokens=getattr(usage, "completion_tokens", None),
+                        total_tokens=getattr(usage, "total_tokens", None),
+                        cache_read_input_tokens=cache_read,
+                    )
                 choices = getattr(chunk, "choices", ())
                 if not choices:
                     continue
@@ -100,7 +135,12 @@ class OpenAIProvider:
                 content = getattr(delta, "content", None)
                 if content:
                     yield TextDelta(content)
+                reasoning_content = getattr(delta, "reasoning_content", None)
+                if reasoning_content:
+                    reasoning += reasoning_content
+                    yield ThinkingDelta(reasoning_content)
                 for call in getattr(delta, "tool_calls", None) or ():
+                    saw_tool_call = True
                     function = getattr(call, "function", None)
                     yield ToolCallDelta(
                         index=getattr(call, "index", 0),
@@ -109,7 +149,14 @@ class OpenAIProvider:
                         arguments_fragment=getattr(function, "arguments", None) or "",
                     )
                 stop_reason = getattr(choice, "finish_reason", None) or stop_reason
-            yield StreamCompleted(stop_reason)
+            if usage_snapshot is not None:
+                yield UsageReported(usage_snapshot)
+            state = (
+                ProviderContinuationState("deepseek", reasoning)
+                if self._is_deepseek and reasoning and saw_tool_call
+                else None
+            )
+            yield StreamCompleted(stop_reason, state)
         except ProviderError:
             raise
         except openai.AuthenticationError as exc:

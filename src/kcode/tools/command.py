@@ -39,7 +39,12 @@ async def _terminate(process: asyncio.subprocess.Process) -> None:
 
 
 class RunCommandTool:
-    spec = ToolSpec("run_command", "Run a command and return its exit code, stdout, and stderr.", RunCommandArgs)
+    spec = ToolSpec(
+        "run_command",
+        "Run a command and return its exit code, stdout, and stderr.",
+        RunCommandArgs,
+        None,
+    )
 
     async def execute(self, arguments: ToolArguments, context: ToolContext) -> ToolResult:
         args = cast(RunCommandArgs, arguments)

@@ -2,7 +2,14 @@ from types import SimpleNamespace
 
 from kcode.config import ProviderConfig
 from kcode.conversation import ChatMessage
-from kcode.events import StreamCompleted, TextDelta, ThinkingDelta, ToolCallDelta
+from kcode.events import (
+    StreamCompleted,
+    TextDelta,
+    ThinkingDelta,
+    TokenUsage,
+    ToolCallDelta,
+    UsageReported,
+)
 from kcode.providers.anthropic import AnthropicProvider
 from kcode.tools.base import ToolDefinition
 
@@ -101,3 +108,25 @@ async def test_anthropic_tool_fragments_and_continuation_state() -> None:
     completed = result[-1]
     assert completed.continuation_state.payload[0]["signature"] == "sig"
     assert messages.request["tool_choice"] == {"type": "auto"}
+
+
+async def test_anthropic_reports_final_usage() -> None:
+    usage = SimpleNamespace(
+        input_tokens=20,
+        output_tokens=5,
+        cache_creation_input_tokens=3,
+        cache_read_input_tokens=7,
+    )
+    messages = FakeMessages([], SimpleNamespace(content=[], usage=usage))
+    provider = AnthropicProvider(
+        ProviderConfig(
+            name="claude",
+            protocol="anthropic",
+            model="m",
+            base_url="https://test",
+            api_key="x",
+        ),
+        SimpleNamespace(messages=messages),
+    )
+    result = [event async for event in provider.stream([ChatMessage("user", "hi")])]
+    assert result[-2] == UsageReported(TokenUsage(20, 5, 25, 3, 7))

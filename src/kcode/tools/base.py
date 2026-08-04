@@ -4,6 +4,7 @@ import json
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -11,6 +12,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
 ToolStatus = Literal["success", "error", "denied", "timeout", "cancelled"]
+
+
+class ToolEffect(StrEnum):
+    READ_ONLY = "read_only"
+    SIDE_EFFECT = "side_effect"
 
 
 class ToolArguments(BaseModel):
@@ -161,6 +167,7 @@ class ToolSpec:
     name: str
     description: str
     arguments_model: type[ToolArguments]
+    effect: ToolEffect | None = ToolEffect.READ_ONLY
 
 
 class Tool(Protocol):
@@ -168,6 +175,16 @@ class Tool(Protocol):
     def spec(self) -> ToolSpec: ...
 
     async def execute(self, arguments: ToolArguments, context: ToolContext) -> ToolResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedToolCall:
+    call: ToolCall
+    tool: Tool | None
+    arguments: ToolArguments | None
+    effect: ToolEffect
+    approval: ApprovalRequest | None = None
+    error: ToolResult | None = None
 
 
 class ToolExecutionError(Exception):

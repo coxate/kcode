@@ -13,6 +13,7 @@ from kcode.tools.base import (
     ToolArguments,
     ToolContext,
     ToolExecutionError,
+    ToolEffect,
     ToolResult,
     ToolSpec,
     WriteFileArgs,
@@ -138,14 +139,24 @@ class ReadFileTool:
 
 
 class WriteFileTool:
-    spec = ToolSpec("write_file", "Create a new UTF-8 text file. Never overwrites.", WriteFileArgs)
+    spec = ToolSpec(
+        "write_file",
+        "Create a new UTF-8 text file. Never overwrites.",
+        WriteFileArgs,
+        ToolEffect.SIDE_EFFECT,
+    )
 
     async def execute(self, arguments: ToolArguments, context: ToolContext) -> ToolResult:
         return await asyncio.to_thread(_write, cast(WriteFileArgs, arguments), context)
 
 
 class EditFileTool:
-    spec = ToolSpec("edit_file", "Replace old_text only when it occurs exactly once.", EditFileArgs)
+    spec = ToolSpec(
+        "edit_file",
+        "Replace old_text only when it occurs exactly once.",
+        EditFileArgs,
+        ToolEffect.SIDE_EFFECT,
+    )
 
     async def execute(self, arguments: ToolArguments, context: ToolContext) -> ToolResult:
         return await asyncio.to_thread(_edit, cast(EditFileArgs, arguments), context)

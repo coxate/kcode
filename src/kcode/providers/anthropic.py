@@ -17,7 +17,15 @@ from kcode.conversation import (
     UserMessage,
 )
 from kcode.errors import ProviderError, ProviderErrorKind
-from kcode.events import ProviderEvent, StreamCompleted, TextDelta, ThinkingDelta, ToolCallDelta
+from kcode.events import (
+    ProviderEvent,
+    StreamCompleted,
+    TextDelta,
+    ThinkingDelta,
+    TokenUsage,
+    ToolCallDelta,
+    UsageReported,
+)
 from kcode.tools.base import ToolDefinition
 
 
@@ -97,6 +105,7 @@ class AnthropicProvider:
             request["tool_choice"] = {"type": tool_choice}
         stop_reason: str | None = None
         state: ProviderContinuationState | None = None
+        usage_snapshot: TokenUsage | None = None
         try:
             async with self._client.messages.stream(**request) as stream:
                 async for event in stream:
@@ -133,6 +142,27 @@ class AnthropicProvider:
                         for block in getattr(final, "content", ())
                     ]
                     state = ProviderContinuationState("anthropic", blocks)
+                    usage = getattr(final, "usage", None)
+                    if usage is not None:
+                        input_tokens = getattr(usage, "input_tokens", None)
+                        output_tokens = getattr(usage, "output_tokens", None)
+                        usage_snapshot = TokenUsage(
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            total_tokens=(
+                                input_tokens + output_tokens
+                                if input_tokens is not None and output_tokens is not None
+                                else None
+                            ),
+                            cache_creation_input_tokens=getattr(
+                                usage, "cache_creation_input_tokens", None
+                            ),
+                            cache_read_input_tokens=getattr(
+                                usage, "cache_read_input_tokens", None
+                            ),
+                        )
+            if usage_snapshot is not None:
+                yield UsageReported(usage_snapshot)
             yield StreamCompleted(stop_reason, state)
         except ProviderError:
             raise

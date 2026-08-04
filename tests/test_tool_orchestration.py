@@ -51,6 +51,6 @@ async def test_single_tool_uses_two_model_requests_and_commits(tmp_path) -> None
     events = [event async for event in runner.run("读取文件")]
     assert len(provider.requests) == 2
     assert provider.requests[0][2] == "auto"
-    assert provider.requests[1][2] == "none"
+    assert provider.requests[1][2] == "auto"
     assert any(isinstance(event, ToolFinished) and event.result.status == "success" for event in events)
     assert conversation.snapshot()[0].assistant == "文件内容是 hello"
