@@ -25,11 +25,19 @@ class ProviderConfig(BaseModel):
     thinking: bool = False
 
 
+class AgentConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_iterations: int = Field(default=10, ge=1, le=100)
+    max_parallel_tools: int = Field(default=4, ge=1, le=16)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     active_provider: str
     providers: dict[str, ProviderConfig]
+    agent: AgentConfig = AgentConfig()
 
     @property
     def active(self) -> ProviderConfig:
@@ -66,19 +74,24 @@ def _read_yaml(path: Path) -> dict[str, Any]:
                 f"Invalid config {path}, field 'providers': duplicate provider name '{name}'."
             )
         names.add(name)
+    agent = value.get("agent", {})
+    if not isinstance(agent, dict):
+        raise ConfigError(f"Invalid config {path}, field 'agent': expected a mapping.")
     return value
 
 
 def _merge_configs(configs: list[tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
     active: str | None = None
     merged: dict[str, dict[str, Any]] = {}
+    agent: dict[str, Any] = {}
     for _, raw in configs:
         if "active_provider" in raw:
             active = raw["active_provider"]
+        agent.update(raw.get("agent", {}))
         for provider in raw.get("providers", []):
             name = provider["name"]
             merged[name] = {**merged.get(name, {}), **provider}
-    return {"active_provider": active, "providers": list(merged.values())}
+    return {"active_provider": active, "providers": list(merged.values()), "agent": agent}
 
 
 def _expand_key(value: Any, *, path_label: str, environ: Mapping[str, str]) -> str:
@@ -134,7 +147,11 @@ def load_config(
                 f"Invalid config {source_label}, field 'active_provider': provider '{active}' "
                 "does not exist."
             )
-        return AppConfig(active_provider=active, providers=providers)
+        return AppConfig(
+            active_provider=active,
+            providers=providers,
+            agent=AgentConfig.model_validate(merged["agent"]),
+        )
     except ValidationError as exc:
         first = exc.errors(include_url=False)[0]
         field = ".".join(str(part) for part in first["loc"])

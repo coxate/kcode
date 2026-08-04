@@ -65,6 +65,40 @@ providers:
     assert config.active.name == "second"
 
 
+def test_agent_config_defaults_and_field_merge(tmp_path: Path) -> None:
+    user = write_config(
+        tmp_path / "user.yaml",
+        """
+active_provider: main
+agent: {max_iterations: 12, max_parallel_tools: 3}
+providers:
+  - {name: main, protocol: openai, model: m, base_url: https://x.test, api_key: k}
+""",
+    )
+    project = write_config(tmp_path / "project.yaml", "agent: {max_parallel_tools: 6}")
+    config = load_config(user, project, {})
+    assert config.agent.max_iterations == 12
+    assert config.agent.max_parallel_tools == 6
+
+
+@pytest.mark.parametrize(
+    "agent",
+    ("{max_iterations: 0}", "{max_iterations: 101}", "{max_parallel_tools: 17}"),
+)
+def test_agent_config_rejects_invalid_limits(tmp_path: Path, agent: str) -> None:
+    path = write_config(
+        tmp_path / "bad-agent.yaml",
+        f"""
+active_provider: main
+agent: {agent}
+providers:
+  - {{name: main, protocol: openai, model: m, base_url: https://x.test, api_key: k}}
+""",
+    )
+    with pytest.raises(ConfigError, match="agent"):
+        load_config(None, path, {})
+
+
 def test_missing_environment_key_is_safe_and_actionable(tmp_path: Path) -> None:
     config = write_config(
         tmp_path / "config.yaml",

@@ -1,5 +1,9 @@
 active_provider: openai
 
+agent:
+  max_iterations: 10
+  max_parallel_tools: 4
+
 providers:
   - name: openai
     protocol: openai

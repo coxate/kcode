@@ -51,10 +51,24 @@ class ChatTurn:
     assistant: str
 
 
+@dataclass(frozen=True, slots=True)
+class TurnHandle:
+    id: int
+    user: str
+
+
+@dataclass(slots=True)
+class _ActiveTurn:
+    handle: TurnHandle
+    checkpointed: bool = False
+
+
 class Conversation:
     def __init__(self) -> None:
         self._messages: list[ConversationMessage] = []
         self._turns: list[ChatTurn] = []
+        self._active: _ActiveTurn | None = None
+        self._next_turn_id = 1
 
     def build_request(self, user_text: str) -> tuple[ConversationMessage, ...]:
         return (*self._messages, ChatMessage("user", user_text))
@@ -79,9 +93,49 @@ class Conversation:
         self._messages.extend(messages)
         self._turns.append(ChatTurn(user, final))
 
+    def begin_turn(self, user_text: str) -> TurnHandle:
+        if self._active is not None:
+            raise RuntimeError("A conversation turn is already active.")
+        handle = TurnHandle(self._next_turn_id, user_text)
+        self._next_turn_id += 1
+        self._active = _ActiveTurn(handle)
+        return handle
+
+    def checkpoint_tool_step(
+        self,
+        handle: TurnHandle,
+        assistant: AssistantMessage,
+        results: tuple[ToolResultMessage, ...],
+    ) -> None:
+        active = self._require_active(handle)
+        if not active.checkpointed:
+            self._messages.append(UserMessage(handle.user))
+            active.checkpointed = True
+        self._messages.extend((assistant, *results))
+
+    def complete_turn(self, handle: TurnHandle, assistant: AssistantMessage) -> None:
+        active = self._require_active(handle)
+        if not assistant.content.strip():
+            raise ValueError("A completed turn requires assistant text.")
+        if not active.checkpointed:
+            self._messages.append(UserMessage(handle.user))
+        self._messages.append(assistant)
+        self._turns.append(ChatTurn(handle.user, assistant.content))
+        self._active = None
+
+    def stop_turn(self, handle: TurnHandle) -> None:
+        self._require_active(handle)
+        self._active = None
+
+    def _require_active(self, handle: TurnHandle) -> _ActiveTurn:
+        if self._active is None or self._active.handle != handle:
+            raise RuntimeError("Conversation turn is not active.")
+        return self._active
+
     def clear(self) -> None:
         self._messages.clear()
         self._turns.clear()
+        self._active = None
 
     def snapshot(self) -> tuple[ChatTurn, ...]:
         return tuple(self._turns)

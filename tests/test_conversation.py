@@ -1,4 +1,11 @@
-from kcode.conversation import ChatMessage, Conversation
+from kcode.conversation import (
+    AssistantMessage,
+    ChatMessage,
+    Conversation,
+    ToolResultMessage,
+    UserMessage,
+)
+from kcode.tools.base import ToolCall, ToolResult
 
 
 def test_only_committed_turns_appear_in_request() -> None:
@@ -19,3 +26,31 @@ def test_clear_removes_history() -> None:
     conversation.commit("hello", "world")
     conversation.clear()
     assert conversation.snapshot() == ()
+
+
+def test_tool_checkpoints_survive_stopped_turn_without_duplicate_user() -> None:
+    conversation = Conversation()
+    handle = conversation.begin_turn("完成任务")
+    call = ToolCall(0, "call-1", "read_file", '{"path":"README.md"}')
+    assistant = AssistantMessage("", (call,))
+    result = ToolResultMessage("call-1", "read_file", ToolResult.success({"content": "ok"}))
+    conversation.checkpoint_tool_step(handle, assistant, (result,))
+    conversation.stop_turn(handle)
+
+    assert conversation.messages_snapshot() == (UserMessage("完成任务"), assistant, result)
+    assert conversation.snapshot() == ()
+
+
+def test_completed_checkpoint_turn_records_one_chat_turn() -> None:
+    conversation = Conversation()
+    handle = conversation.begin_turn("完成任务")
+    call = ToolCall(0, "call-1", "read_file", "{}")
+    conversation.checkpoint_tool_step(
+        handle,
+        AssistantMessage("", (call,)),
+        (ToolResultMessage("call-1", "read_file", ToolResult.success({})),),
+    )
+    conversation.complete_turn(handle, AssistantMessage("完成了"))
+
+    assert conversation.snapshot()[0].assistant == "完成了"
+    assert sum(isinstance(item, UserMessage) for item in conversation.messages_snapshot()) == 1
