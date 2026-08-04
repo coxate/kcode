@@ -265,16 +265,20 @@ class KCodeApp(App[None]):
                     if event.reason != AgentStopReason.COMPLETED:
                         labels = {
                             AgentStopReason.ITERATION_LIMIT: "已达到迭代安全上限",
-                            AgentStopReason.CANCELLED: "Cancelled：已取消",
+                            AgentStopReason.CANCELLED: "用户已取消当前任务",
                             AgentStopReason.UNKNOWN_TOOL_LIMIT: "连续请求未知工具",
                             AgentStopReason.STREAM_ERROR: "模型流出错",
                             AgentStopReason.INVALID_RESPONSE: "模型响应无效",
                         }
-                        detail = f"：{event.detail}" if event.detail else ""
-                        answer += (
-                            f"\n\n*已停止：{labels.get(event.reason, event.reason.value)}"
-                            f"{detail}。*"
-                        )
+                        label = labels.get(event.reason, event.reason.value)
+                        detail = event.detail.rstrip("。")
+                        message = detail or label
+                        if detail and event.reason in {
+                            AgentStopReason.STREAM_ERROR,
+                            AgentStopReason.INVALID_RESPONSE,
+                        }:
+                            message = f"{label}（{detail}）"
+                        answer += f"\n\n*已停止：{message}。*"
                     self._set_agent_status(
                         "完成"
                         if event.reason == AgentStopReason.COMPLETED

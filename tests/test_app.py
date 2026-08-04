@@ -96,7 +96,7 @@ async def test_ctrl_c_cancels_partial_answer_without_history() -> None:
         assert conversation.snapshot() == ()
         assert provider.closed is True
         assert app.query_one("#prompt", Input).disabled is False
-        assert "Cancelled" in app.query_one(AssistantResponse).answer_text
+        assert "用户已取消当前任务。" in app.query_one(AssistantResponse).answer_text
         provider.events = [TextDelta("next works"), StreamCompleted("stop")]
         provider.delay = 0
         await submit(app, pilot, "next")
@@ -239,7 +239,7 @@ async def test_ctrl_c_cancels_pending_approval(tmp_path) -> None:
         await pilot.pause(0.15)
         assert not outside.exists()
         assert app.query_one("#prompt", Input).disabled is False
-        assert "Cancelled" in list(app.query(AssistantResponse))[-1].answer_text
+        assert "用户已取消当前任务。" in list(app.query(AssistantResponse))[-1].answer_text
 
 
 class SixToolProvider:
