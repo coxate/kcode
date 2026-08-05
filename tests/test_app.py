@@ -83,6 +83,37 @@ async def test_stream_commits_history_and_folds_thinking() -> None:
         assert len(provider.requests[1]) == 3
 
 
+async def test_streaming_temporarily_disables_text_selection() -> None:
+    release_stream = asyncio.Event()
+
+    class PausedProvider(FakeProvider):
+        async def stream(self, messages):
+            self.requests.append(tuple(messages))
+            try:
+                yield TextDelta("streaming")
+                await release_stream.wait()
+                yield TextDelta(" response")
+                yield StreamCompleted("stop")
+            finally:
+                self.closed = True
+
+    provider = PausedProvider()
+    app = KCodeApp(provider)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await submit(app, pilot, "render safely")
+        await pilot.pause(0.05)
+
+        assert app.generating is True
+        assert app.ALLOW_SELECT is False
+        await pilot.click("#answer-content")
+
+        release_stream.set()
+        await pilot.pause(0.1)
+        assert app.generating is False
+        assert app.ALLOW_SELECT is True
+        assert app.query_one(AssistantResponse).answer_text == "streaming response"
+
+
 async def test_ctrl_c_cancels_partial_answer_without_history() -> None:
     provider = FakeProvider([TextDelta("partial"), TextDelta("later"), StreamCompleted()], delay=0.2)
     conversation = Conversation()

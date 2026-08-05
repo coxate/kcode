@@ -205,6 +205,9 @@ class KCodeApp(App[None]):
 
     def _set_generating(self, value: bool) -> None:
         self.generating = value
+        # Markdown 流式更新会替换内部段落。若此时开始文本选择，Textual
+        # 可能命中一个刚被移除的段落并在选区处理中崩溃。生成结束后恢复选择。
+        self.ALLOW_SELECT = not value
         prompt = self.query_one("#prompt", Input)
         prompt.disabled = value
         if not value:
