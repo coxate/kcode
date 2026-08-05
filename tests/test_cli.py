@@ -6,7 +6,9 @@ from kcode import cli
 from kcode.config import load_config
 
 
-def test_cli_returns_nonzero_before_tui_when_config_is_missing(monkeypatch, capsys, tmp_path: Path) -> None:
+def test_cli_returns_nonzero_before_tui_when_config_is_missing(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
     missing_user = tmp_path / "user" / "config.yaml"
     missing_project = tmp_path / "project" / "config.yaml"
     monkeypatch.setattr(cli, "default_config_paths", lambda cwd: (missing_user, missing_project))

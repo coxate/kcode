@@ -1,0 +1,10 @@
+defaultMode: default
+
+allow:
+  - Bash(git status)
+  - Bash(git diff *)
+  - Write(src/generated/**)
+
+deny:
+  - Bash(git push *)
+  - Read(.env)

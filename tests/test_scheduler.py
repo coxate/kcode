@@ -1,12 +1,25 @@
 import asyncio
 from dataclasses import dataclass
 
+from kcode.permissions import (
+    LocalPermissionStore,
+    PermissionEngine,
+    empty_permission_settings,
+)
 from kcode.session import AgentMode
 from kcode.tools.base import ToolCall, ToolContext, ToolEffect, ToolResult
 from kcode.tools.executor import ToolExecutor
-from kcode.tools.policy import ToolPolicy
 from kcode.tools.registry import ToolRegistry
 from kcode.tools.scheduler import ToolScheduler
+
+
+def make_executor(registry: ToolRegistry, root) -> ToolExecutor:
+    settings = empty_permission_settings(root)
+    return ToolExecutor(
+        registry,
+        PermissionEngine(settings),
+        LocalPermissionStore(settings.layers[0].path),
+    )
 
 
 async def allow(_request):
@@ -56,9 +69,11 @@ async def test_scheduler_parallelizes_readers_and_serializes_side_effects(tmp_pa
         ("read_c", ToolEffect.READ_ONLY),
     ):
         registry.register(make_tool(name, effect, probe))
-    executor = ToolExecutor(registry, ToolPolicy(tmp_path))
+    executor = make_executor(registry, tmp_path)
     prepared = tuple(
-        executor.prepare(ToolCall(index, str(index), name, "{}"), ToolContext(tmp_path), AgentMode.DO)
+        executor.prepare(
+            ToolCall(index, str(index), name, "{}"), ToolContext(tmp_path), AgentMode.DO
+        )
         for index, name in enumerate(("read_a", "read_b", "write", "read_c"))
     )
     scheduler = ToolScheduler(executor, max_parallel=2)
@@ -74,7 +89,7 @@ async def test_scheduler_cancels_all_running_readers(tmp_path) -> None:
     registry = ToolRegistry()
     registry.register(make_tool("read_a", ToolEffect.READ_ONLY, probe))
     registry.register(make_tool("read_b", ToolEffect.READ_ONLY, probe))
-    executor = ToolExecutor(registry, ToolPolicy(tmp_path))
+    executor = make_executor(registry, tmp_path)
     context = ToolContext(tmp_path)
     prepared = tuple(
         executor.prepare(ToolCall(index, str(index), name, "{}"), context, AgentMode.DO)

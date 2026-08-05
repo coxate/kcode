@@ -77,7 +77,5 @@ class ToolScheduler:
     ) -> tuple[ToolResult, ...]:
         results: list[ToolResult] = []
         for batch in self.batches(calls):
-            results.extend(
-                await self.execute_batch(batch, context, approve, cancel_event)
-            )
+            results.extend(await self.execute_batch(batch, context, approve, cancel_event))
         return tuple(results)

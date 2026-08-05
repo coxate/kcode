@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable
+
+from kcode.permissions.models import (
+    FriendlyToolName,
+    PermissionLayer,
+    PermissionRule,
+    PermissionSource,
+)
+
+FRIENDLY_NAMES = {"Bash", "Read", "Write", "Edit", "Glob", "Grep"}
+RULE_PATTERN = re.compile(r"^(Bash|Read|Write|Edit|Glob|Grep)(?:\((.*)\))?$", re.DOTALL)
+SOURCE_BY_LAYER: dict[str, PermissionSource] = {
+    "local": PermissionSource.LOCAL_RULE,
+    "project": PermissionSource.PROJECT_RULE,
+    "user": PermissionSource.USER_RULE,
+}
+
+
+def parse_rule(raw: str) -> PermissionRule:
+    if not isinstance(raw, str):
+        raise ValueError("permission rules must be strings")
+    value = raw.strip()
+    match = RULE_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError(f"invalid permission rule: {raw!r}")
+    pattern = match.group(2)
+    if pattern is not None and not pattern:
+        raise ValueError("permission rule patterns cannot be empty")
+    return PermissionRule(value, match.group(1), pattern)  # type: ignore[arg-type]
+
+
+def parse_rules(values: Iterable[str]) -> tuple[PermissionRule, ...]:
+    return tuple(parse_rule(value) for value in values)
+
+
+def _glob_regex(pattern: str, *, path: bool) -> re.Pattern[str]:
+    output = ["^"]
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "*":
+            if index + 1 < len(pattern) and pattern[index + 1] == "*":
+                output.append(".*")
+                index += 2
+                continue
+            output.append("[^/]*" if path else ".*")
+        else:
+            output.append(re.escape(character))
+        index += 1
+    output.append("$")
+    return re.compile("".join(output))
+
+
+def rule_matches(rule: PermissionRule, tool_name: FriendlyToolName, value: str) -> bool:
+    if rule.tool_name != tool_name:
+        return False
+    if rule.pattern is None:
+        return True
+    if "*" not in rule.pattern:
+        return value == rule.pattern
+    return _glob_regex(rule.pattern, path=tool_name != "Bash").fullmatch(value) is not None
+
+
+def match_layers(
+    layers: tuple[PermissionLayer, ...], tool_name: FriendlyToolName, value: str
+) -> tuple[bool, PermissionSource, PermissionRule] | None:
+    for layer in layers:
+        source = SOURCE_BY_LAYER[layer.name]
+        for rule in layer.deny:
+            if rule_matches(rule, tool_name, value):
+                return False, source, rule
+        for rule in layer.allow:
+            if rule_matches(rule, tool_name, value):
+                return True, source, rule
+    return None

@@ -29,11 +29,18 @@ from kcode.events import (
     TurnNotice,
 )
 from kcode.orchestration import AgentRunner
+from kcode.permissions import (
+    ApprovalChoice,
+    LocalPermissionStore,
+    PermissionEngine,
+    PermissionMode,
+    PermissionSettings,
+    empty_permission_settings,
+)
 from kcode.providers.base import ChatProvider
-from kcode.session import AgentMode, AgentSession
+from kcode.session import AgentSession
 from kcode.tools.base import ApprovalRequest, ToolContext
 from kcode.tools.executor import ToolExecutor
-from kcode.tools.policy import ToolPolicy
 from kcode.tools.registry import ToolRegistry, create_default_registry
 from kcode.ui.approval import ApprovalScreen
 from kcode.ui.commands import CommandKind, parse_command
@@ -65,11 +72,14 @@ class KCodeApp(App[None]):
     #prompt-marker { width: 3; padding-left: 1; color: $accent; text-style: bold; }
     #prompt { width: 1fr; border: none; }
     #status { height: 1; dock: bottom; background: $primary-darken-2; color: $text; }
-    #provider-status { width: 1fr; padding-left: 1; }
+    #permission-status { width: 1fr; padding-left: 1; }
     #agent-status { width: auto; padding-right: 2; }
     #model-status { width: auto; padding-right: 1; }
     """
-    BINDINGS = [Binding("ctrl+c", "interrupt", "Cancel / Exit", show=False)]
+    BINDINGS = [
+        Binding("ctrl+c", "interrupt", "Cancel / Exit", show=False, priority=True),
+        Binding("shift+tab", "cycle_permissions", "Permissions", show=False, priority=True),
+    ]
 
     def __init__(
         self,
@@ -82,6 +92,8 @@ class KCodeApp(App[None]):
         context: ToolContext | None = None,
         agent_config: AgentConfig | None = None,
         session: AgentSession | None = None,
+        permission_settings: PermissionSettings | None = None,
+        permission_store: LocalPermissionStore | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -91,12 +103,22 @@ class KCodeApp(App[None]):
         self.registry = registry or create_default_registry()
         self.context = context or ToolContext(self.cwd)
         self.agent_config = agent_config or AgentConfig()
-        self.session = session or AgentSession()
+        if permission_settings is None:
+            permission_settings = empty_permission_settings(self.cwd)
+        self.permission_settings = permission_settings
+        self.permission_store = permission_store or LocalPermissionStore(
+            permission_settings.layers[0].path
+        )
+        self.permission_engine = PermissionEngine(permission_settings)
+        self.session = session or AgentSession(
+            permission_settings.initial_mode,
+            initial_mode=permission_settings.initial_mode,
+        )
         self.runner = AgentRunner(
             provider,
             self.conversation,
             self.registry,
-            ToolExecutor(self.registry, ToolPolicy(self.cwd)),
+            ToolExecutor(self.registry, self.permission_engine, self.permission_store),
             self.context,
             self._request_approval,
             self.agent_config,
@@ -120,7 +142,7 @@ class KCodeApp(App[None]):
             yield Static("❯", id="prompt-marker")
             yield Input(placeholder="Send a message...", id="prompt")
         with Horizontal(id="status"):
-            yield Static(f"Provider: {self.provider.display_name}", id="provider-status")
+            yield Static(self._permission_status_text(), id="permission-status")
             yield Static(self._agent_status_text(), id="agent-status")
             yield Static(f"Model: {self.provider.model_name}", id="model-status")
 
@@ -130,24 +152,31 @@ class KCodeApp(App[None]):
             await self._append_notice(warning, "system")
 
     def _agent_status_text(self, phase: str | None = None) -> str:
-        mode = "PLAN" if self.session.mode == AgentMode.PLAN else "DO"
         iteration = (
-            f" · {self._iteration}/{self.agent_config.max_iterations}"
-            if self._iteration
-            else ""
+            f" · {self._iteration}/{self.agent_config.max_iterations}" if self._iteration else ""
         )
         total = self._usage.total_tokens
         tokens = f" · Token {total}" if total is not None else " · Token ?"
         suffix = f" · {phase}" if phase else ""
-        return f"Mode: {mode}{iteration}{tokens}{suffix}"
+        return f"Agent{iteration}{tokens}{suffix}"
+
+    def _permission_status_text(self) -> str:
+        return f"Permissions: {self.session.permission_mode.value}"
+
+    def _set_permission_status(self) -> None:
+        self.query_one("#permission-status", Static).update(self._permission_status_text())
 
     def _set_agent_status(self, phase: str | None = None) -> None:
         self.query_one("#agent-status", Static).update(self._agent_status_text(phase))
 
-    async def _request_approval(self, request: ApprovalRequest) -> bool:
+    async def _request_approval(self, request: ApprovalRequest) -> ApprovalChoice:
         self._set_agent_status("等待授权")
         try:
-            return await self.push_screen_wait(ApprovalScreen(request))
+            choice = await self.push_screen_wait(ApprovalScreen(request))
+            if choice is None:
+                self.runner.cancel()
+                return ApprovalChoice.DENY
+            return choice
         finally:
             self._set_agent_status()
 
@@ -177,26 +206,29 @@ class KCodeApp(App[None]):
 
     async def _run_command(self, kind: CommandKind, raw: str) -> None:
         if kind == CommandKind.HELP:
-            await self._append_notice("命令：`/plan`、`/do`、`/help`、`/clear`、`/exit`")
+            await self._append_notice(
+                "命令：`/plan`、`/do`、`/help`、`/clear`、`/exit`；Shift+Tab 切换权限模式。"
+            )
         elif kind == CommandKind.CLEAR:
             self.conversation.clear()
             self.session.clear()
             self._iteration = 0
             self._usage = TokenUsage()
             await self.query_one("#chat", VerticalScroll).remove_children()
+            self._set_permission_status()
             self._set_agent_status()
         elif kind == CommandKind.PLAN:
-            self.session.set_mode(AgentMode.PLAN)
+            self.session.set_mode(PermissionMode.PLAN)
             self._iteration = 0
+            self._set_permission_status()
             self._set_agent_status()
-            await self._append_notice(
-                "已进入 Plan Mode：只允许读取、查找、搜索和白名单只读命令。"
-            )
+            await self._append_notice("已进入 Plan Mode：只允许读取、查找、搜索和白名单只读命令。")
         elif kind == CommandKind.DO:
-            self.session.set_mode(AgentMode.DO)
+            has_plan = self.session.approve_plan()
             self._iteration = 0
+            self._set_permission_status()
             self._set_agent_status()
-            suffix = "，下一条请求将使用最新计划一次。" if self.session.latest_plan else "。"
+            suffix = "，下一条请求将使用最新计划一次。" if has_plan else "。"
             await self._append_notice("已进入 Do Mode" + suffix)
         elif kind == CommandKind.EXIT:
             self.exit()
@@ -214,9 +246,7 @@ class KCodeApp(App[None]):
             prompt.focus()
 
     @work(exclusive=True, group="generation")
-    async def generate_response(
-        self, user_text: str, response: AssistantResponse
-    ) -> None:
+    async def generate_response(self, user_text: str, response: AssistantResponse) -> None:
         answer = ""
         thinking = ""
         last_refresh = 0.0
@@ -242,9 +272,7 @@ class KCodeApp(App[None]):
                         else:
                             current_response.finish_thinking()
                             current_response = AssistantResponse(event.iteration)
-                            await self.query_one("#chat", VerticalScroll).mount(
-                                current_response
-                            )
+                            await self.query_one("#chat", VerticalScroll).mount(current_response)
                             self._active_response = current_response
                             answer = ""
                             thinking = ""
@@ -283,9 +311,7 @@ class KCodeApp(App[None]):
                             message = f"{label}（{detail}）"
                         answer += f"\n\n*已停止：{message}。*"
                     self._set_agent_status(
-                        "完成"
-                        if event.reason == AgentStopReason.COMPLETED
-                        else "已停止"
+                        "完成" if event.reason == AgentStopReason.COMPLETED else "已停止"
                     )
                 now = time.monotonic()
                 if now - last_refresh >= 1 / 30:
@@ -315,6 +341,11 @@ class KCodeApp(App[None]):
         if self.generating and self._generation_worker is not None:
             self.runner.cancel()
             if isinstance(self.screen, ApprovalScreen):
-                self.screen.dismiss(False)
+                self.screen.dismiss(None)
         else:
             self.exit()
+
+    def action_cycle_permissions(self) -> None:
+        self.session.cycle_mode()
+        self._set_permission_status()
+        self._set_agent_status()

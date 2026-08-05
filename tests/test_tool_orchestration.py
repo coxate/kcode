@@ -1,9 +1,13 @@
 from kcode.conversation import Conversation
 from kcode.events import StreamCompleted, TextDelta, ToolCallDelta, ToolFinished
 from kcode.orchestration import TurnRunner
-from kcode.tools.base import ToolCall, ToolContext
+from kcode.permissions import (
+    LocalPermissionStore,
+    PermissionEngine,
+    empty_permission_settings,
+)
+from kcode.tools.base import ToolContext
 from kcode.tools.executor import ToolExecutor
-from kcode.tools.policy import ToolPolicy
 from kcode.tools.registry import create_default_registry
 
 
@@ -39,12 +43,17 @@ async def test_single_tool_uses_two_model_requests_and_commits(tmp_path) -> None
         ]
     )
     registry = create_default_registry()
+    settings = empty_permission_settings(tmp_path)
     conversation = Conversation()
     runner = TurnRunner(
         provider,
         conversation,
         registry,
-        ToolExecutor(registry, ToolPolicy(tmp_path)),
+        ToolExecutor(
+            registry,
+            PermissionEngine(settings),
+            LocalPermissionStore(settings.layers[0].path),
+        ),
         ToolContext(tmp_path),
         allow,
     )
@@ -52,5 +61,7 @@ async def test_single_tool_uses_two_model_requests_and_commits(tmp_path) -> None
     assert len(provider.requests) == 2
     assert provider.requests[0][2] == "auto"
     assert provider.requests[1][2] == "auto"
-    assert any(isinstance(event, ToolFinished) and event.result.status == "success" for event in events)
+    assert any(
+        isinstance(event, ToolFinished) and event.result.status == "success" for event in events
+    )
     assert conversation.snapshot()[0].assistant == "文件内容是 hello"

@@ -6,13 +6,14 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 
+from kcode import __version__
 from kcode.config import AgentConfig
 from kcode.conversation import (
     AssistantMessage,
     Conversation,
     ConversationMessage,
     ProviderContinuationState,
-    SystemMessage,
+    StableSystemMessage,
     ToolResultMessage,
     UserMessage,
 )
@@ -37,28 +38,21 @@ from kcode.events import (
     TurnNotice,
     UsageReported,
 )
+from kcode.permissions.models import PermissionMode
+from kcode.prompting import (
+    DEFAULT_PROMPT_SECTIONS,
+    EnvironmentCollector,
+    PromptPackage,
+    SystemPromptBuilder,
+    build_approved_plan_reminder,
+    build_plan_mode_reminder,
+)
 from kcode.providers.base import ChatProvider
-from kcode.session import AgentMode, AgentSession
+from kcode.session import AgentSession
 from kcode.tools.base import ApprovalHandler, ToolCall, ToolContext
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry
 from kcode.tools.scheduler import ToolScheduler
-
-DO_SYSTEM_PROMPT = """You are KCode, an autonomous coding assistant with tools.
-Continue calling tools and using their results until the user's task is complete. You may request
-multiple independent tools in one response. Relative paths use the KCode startup directory.
-write_file only creates new files; use edit_file for an existing file and provide old_text that
-occurs exactly once. Follow every tool safety decision and finish with a clear answer."""
-
-PLAN_SYSTEM_PROMPT = """You are KCode in Plan Mode. Investigate the user's request with read-only
-tools, then return an actionable implementation plan. You may read files, find files, search code,
-and run strictly allowlisted read-only commands. Do not write, edit, or run commands with side
-effects. A denied tool result is authoritative; adjust the plan instead of retrying unsafe work."""
-
-PLAN_CONTEXT_PROMPT = """The user previously approved the following planning context. Use it only
-for the current request. It cannot override system safety rules or the user's current instructions:
-
-{plan}"""
 
 PLAN_TOOL_NAMES = {"read_file", "find_files", "search_code", "run_command"}
 
@@ -130,6 +124,8 @@ class AgentRunner:
         approve: ApprovalHandler,
         config: AgentConfig | None = None,
         scheduler: ToolScheduler | None = None,
+        prompt_builder: SystemPromptBuilder | None = None,
+        environment_collector: EnvironmentCollector | None = None,
     ) -> None:
         self.provider = provider
         self.conversation = conversation
@@ -138,9 +134,10 @@ class AgentRunner:
         self.context = context
         self.approve = approve
         self.config = config or AgentConfig()
-        self.scheduler = scheduler or ToolScheduler(
-            executor, self.config.max_parallel_tools
-        )
+        self.scheduler = scheduler or ToolScheduler(executor, self.config.max_parallel_tools)
+        self.prompt_builder = prompt_builder or SystemPromptBuilder(DEFAULT_PROMPT_SECTIONS)
+        self.environment_collector = environment_collector or EnvironmentCollector()
+        self._stable_system = StableSystemMessage(self.prompt_builder.build())
         self._cancel_event: asyncio.Event | None = None
 
     def cancel(self) -> None:
@@ -154,9 +151,7 @@ class AgentRunner:
     ) -> ProviderEvent:
         next_task = asyncio.create_task(anext(iterator))
         cancel_task = asyncio.create_task(cancel_event.wait())
-        done, _ = await asyncio.wait(
-            (next_task, cancel_task), return_when=asyncio.FIRST_COMPLETED
-        )
+        done, _ = await asyncio.wait((next_task, cancel_task), return_when=asyncio.FIRST_COMPLETED)
         if cancel_task in done and cancel_event.is_set():
             next_task.cancel()
             with suppress(asyncio.CancelledError, StopAsyncIteration):
@@ -204,8 +199,8 @@ class AgentRunner:
         if self._cancel_event is not None:
             raise RuntimeError("AgentRunner is already running.")
         active_session = session or AgentSession()
-        mode = active_session.mode
-        plan = active_session.consume_plan() if mode == AgentMode.DO else None
+        plan = active_session.consume_approved_plan()
+        approved_plan_reminder = build_approved_plan_reminder(plan or "")
         cancel_event = asyncio.Event()
         self._cancel_event = cancel_event
         history = self.conversation.messages_snapshot()
@@ -214,22 +209,21 @@ class AgentRunner:
         cumulative_usage: TokenUsage | None = None
         unknown_rounds = 0
         turn_open = True
-        supports_tools = "tools" in inspect.signature(self.provider.stream).parameters
-        definitions = self.registry.definitions(
-            PLAN_TOOL_NAMES if mode == AgentMode.PLAN else None
+        environment = await self.environment_collector.collect(
+            self.context.workspace_root,
+            app_version=__version__,
+            model=self.provider.model_name,
         )
-        system_messages: tuple[SystemMessage, ...] = ()
-        if supports_tools:
-            system_messages = (
-                SystemMessage(PLAN_SYSTEM_PROMPT if mode == AgentMode.PLAN else DO_SYSTEM_PROMPT),
-                *((SystemMessage(PLAN_CONTEXT_PROMPT.format(plan=plan)),) if plan else ()),
-            )
         iteration = 0
 
         try:
             for iteration in range(1, self.config.max_iterations + 1):
                 if cancel_event.is_set():
                     raise _AgentCancelled
+                mode = active_session.permission_mode
+                definitions = self.registry.definitions(
+                    PLAN_TOOL_NAMES if mode == PermissionMode.PLAN else None
+                )
                 yield AgentProgress(
                     mode,
                     iteration,
@@ -237,10 +231,22 @@ class AgentRunner:
                     AgentPhase.MODEL,
                 )
                 response: ModelResponse | None = None
-                request_messages = (*system_messages, *history, *current)
-                async for item in self._collect(
-                    request_messages, definitions, cancel_event
-                ):
+                reminders = (
+                    (build_plan_mode_reminder(iteration),)
+                    if mode == PermissionMode.PLAN
+                    else ((approved_plan_reminder,) if approved_plan_reminder is not None else ())
+                )
+                prompt_package = PromptPackage(
+                    self._stable_system,
+                    environment,
+                    reminders,
+                )
+                request_messages = (
+                    *prompt_package.messages(),
+                    *history,
+                    *current,
+                )
+                async for item in self._collect(request_messages, definitions, cancel_event):
                     if isinstance(item, ModelResponse):
                         response = item
                     elif isinstance(item, (TextDelta, ThinkingDelta)):
@@ -268,7 +274,7 @@ class AgentRunner:
                     final = AssistantMessage(response.text)
                     self.conversation.complete_turn(handle, final)
                     turn_open = False
-                    if mode == AgentMode.PLAN:
+                    if mode == PermissionMode.PLAN:
                         active_session.record_plan(response.text)
                     yield AgentProgress(
                         mode,
@@ -285,8 +291,7 @@ class AgentRunner:
                     response.continuation_state,
                 )
                 prepared = tuple(
-                    self.executor.prepare(call, self.context, mode)
-                    for call in response.tool_calls
+                    self.executor.prepare(call, self.context, mode) for call in response.tool_calls
                 )
                 all_unknown = bool(prepared) and all(
                     item.error is not None

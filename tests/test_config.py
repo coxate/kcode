@@ -123,7 +123,8 @@ providers:
         ("providers: nope", "providers"),
         ("active_provider: absent\nproviders: []", "active_provider"),
         (
-            "active_provider: x\nproviders:\n  - {name: x, protocol: bad, model: m, base_url: u, api_key: k}",
+            "active_provider: x\nproviders:\n"
+            "  - {name: x, protocol: bad, model: m, base_url: u, api_key: k}",
             "protocol",
         ),
     ],

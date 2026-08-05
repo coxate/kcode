@@ -1,17 +1,16 @@
-import json
 from pathlib import Path
 
 from kcode.tools.base import (
     EditFileArgs,
     FindFilesArgs,
     ReadFileArgs,
+    RunCommandArgs,
     SearchCodeArgs,
     ToolContext,
     WriteFileArgs,
 )
-from kcode.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
 from kcode.tools.command import RunCommandTool
-from kcode.tools.base import RunCommandArgs
+from kcode.tools.filesystem import EditFileTool, ReadFileTool, WriteFileTool
 from kcode.tools.registry import create_default_registry
 from kcode.tools.search import FindFilesTool, SearchCodeTool
 
@@ -30,6 +29,14 @@ def test_default_registry_contains_six_tools_and_schemas() -> None:
     assert all(item.parameters["additionalProperties"] is False for item in registry.definitions())
 
 
+def test_tool_descriptions_reinforce_purpose_built_tools_and_read_before_edit() -> None:
+    descriptions = {item.name: item.description for item in create_default_registry().definitions()}
+    assert "purpose-built" in descriptions["find_files"]
+    assert "purpose-built" in descriptions["search_code"]
+    assert "never substitute" in descriptions["run_command"]
+    assert "read_file in the current task" in descriptions["edit_file"]
+
+
 async def test_read_file_chunks_without_overlap(tmp_path: Path) -> None:
     target = tmp_path / "large.txt"
     target.write_text("".join(f"line {index}\n" for index in range(1, 8)), encoding="utf-8")
@@ -46,7 +53,9 @@ async def test_read_file_chunks_without_overlap(tmp_path: Path) -> None:
 async def test_write_only_creates_and_edit_requires_unique_match(tmp_path: Path) -> None:
     context = ToolContext(tmp_path)
     target = tmp_path / "sample.txt"
-    created = await WriteFileTool().execute(WriteFileArgs(path=str(target), content="one two"), context)
+    created = await WriteFileTool().execute(
+        WriteFileArgs(path=str(target), content="one two"), context
+    )
     assert created.status == "success"
     try:
         await WriteFileTool().execute(WriteFileArgs(path=str(target), content="overwrite"), context)
@@ -69,7 +78,9 @@ async def test_find_and_search_are_sorted(tmp_path: Path) -> None:
     (tmp_path / "b.py").write_text("needle\n", encoding="utf-8")
     (tmp_path / "a.py").write_text("none\nneedle\n", encoding="utf-8")
     context = ToolContext(tmp_path)
-    found = await FindFilesTool().execute(FindFilesArgs(root=str(tmp_path), pattern="*.py"), context)
+    found = await FindFilesTool().execute(
+        FindFilesArgs(root=str(tmp_path), pattern="*.py"), context
+    )
     assert [Path(item).name for item in found.data["matches"]] == ["a.py", "b.py"]  # type: ignore[index,union-attr]
     searched = await SearchCodeTool().execute(
         SearchCodeArgs(root=str(tmp_path), pattern="needle", file_pattern="*.py"), context

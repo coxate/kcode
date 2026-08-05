@@ -6,9 +6,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from kcode.permissions.models import ApprovalChoice
 
 JSONValue: TypeAlias = None | bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"]
 ToolStatus = Literal["success", "error", "denied", "timeout", "cancelled"]
@@ -155,11 +158,12 @@ class ToolContext:
 class ApprovalRequest:
     tool_call_id: str
     tool_name: str
-    summary: str
+    preview: str
     reason: str
+    permanent_rule: str
 
 
-ApprovalHandler: TypeAlias = Callable[[ApprovalRequest], Awaitable[bool]]
+ApprovalHandler: TypeAlias = Callable[[ApprovalRequest], Awaitable["ApprovalChoice"]]
 
 
 @dataclass(frozen=True, slots=True)

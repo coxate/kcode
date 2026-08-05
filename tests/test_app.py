@@ -4,7 +4,7 @@ import json
 import pytest
 from textual.widgets import Collapsible, Input, Markdown, Static
 
-from kcode.conversation import Conversation
+from kcode.conversation import Conversation, EnvironmentMessage, StableSystemMessage
 from kcode.errors import ProviderError, ProviderErrorKind
 from kcode.events import (
     StreamCompleted,
@@ -14,7 +14,8 @@ from kcode.events import (
     ToolCallDelta,
     UsageReported,
 )
-from kcode.session import AgentMode
+from kcode.permissions.models import PermissionMode
+from kcode.session import AgentMode, AgentSession
 from kcode.ui.app import KCodeApp
 from kcode.ui.approval import ApprovalScreen
 from kcode.ui.widgets import AssistantResponse, ChatMessageWidget, ToolCallWidget
@@ -54,11 +55,11 @@ async def test_ac7_fixed_layout_at_80_by_24() -> None:
     app = KCodeApp(FakeProvider(), cwd=None)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        assert "KCode v0.3.0" in str(app.query_one("#banner", Static).content)
+        assert "KCode v0.4.0" in str(app.query_one("#banner", Static).content)
         assert app.query_one("#ready").render().plain == "Ready. Ask me anything."
         assert app.query_one("#prompt-marker", Static).content == "❯"
         assert app.query_one("#prompt", Input).placeholder == "Send a message..."
-        assert "fake-provider" in str(app.query_one("#provider-status", Static).content)
+        assert "Permissions: default" in str(app.query_one("#permission-status", Static).content)
         assert "fake-model" in str(app.query_one("#model-status", Static).content)
         assert app.query_one("#chat").region.height > 0
 
@@ -80,7 +81,12 @@ async def test_stream_commits_history_and_folds_thinking() -> None:
         assert conversation.snapshot()[0].assistant == "hello world"
         await submit(app, pilot, "second")
         await pilot.pause(0.15)
-        assert len(provider.requests[1]) == 3
+        history_and_current = [
+            item
+            for item in provider.requests[1]
+            if not isinstance(item, (StableSystemMessage, EnvironmentMessage))
+        ]
+        assert len(history_and_current) == 3
 
 
 async def test_streaming_temporarily_disables_text_selection() -> None:
@@ -115,7 +121,9 @@ async def test_streaming_temporarily_disables_text_selection() -> None:
 
 
 async def test_ctrl_c_cancels_partial_answer_without_history() -> None:
-    provider = FakeProvider([TextDelta("partial"), TextDelta("later"), StreamCompleted()], delay=0.2)
+    provider = FakeProvider(
+        [TextDelta("partial"), TextDelta("later"), StreamCompleted()], delay=0.2
+    )
     conversation = Conversation()
     app = KCodeApp(provider, conversation)
     async with app.run_test(size=(80, 24)) as pilot:
@@ -170,12 +178,23 @@ async def test_plan_and_do_commands_update_visible_mode() -> None:
         await submit(app, pilot, "/plan")
         await pilot.pause()
         assert app.session.mode == AgentMode.PLAN
-        assert "Mode: PLAN" in app.query_one("#agent-status", Static).render().plain
+        assert "Permissions: plan" in app.query_one("#permission-status", Static).render().plain
         app.session.record_plan("计划")
         await submit(app, pilot, "/do")
         await pilot.pause()
         assert app.session.mode == AgentMode.DO
-        assert "Mode: DO" in app.query_one("#agent-status", Static).render().plain
+        assert "Permissions: default" in app.query_one("#permission-status", Static).render().plain
+
+
+async def test_shift_tab_cycles_all_permission_modes() -> None:
+    app = KCodeApp(FakeProvider())
+    expected = ("acceptEdits", "plan", "bypassPermissions", "default")
+    async with app.run_test(size=(100, 30)) as pilot:
+        for mode in expected:
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.session.permission_mode.value == mode
+            assert mode in app.query_one("#permission-status", Static).render().plain
 
 
 async def test_usage_and_iteration_are_shown_in_status() -> None:
@@ -193,7 +212,9 @@ async def test_usage_and_iteration_are_shown_in_status() -> None:
         status = app.query_one("#agent-status", Static).render().plain
         assert "1/10" in status
         assert "Token 10" in status
-        assert "第 1 轮" in app.query_one(AssistantResponse).query_one(".message-role").render().plain
+        assert (
+            "第 1 轮" in app.query_one(AssistantResponse).query_one(".message-role").render().plain
+        )
 
 
 async def test_openai_thinking_warning_is_shown_without_a_request() -> None:
@@ -243,16 +264,21 @@ class ToolCallingProvider:
 async def test_external_write_approval_can_be_denied(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    outside = tmp_path / "outside.txt"
-    app = KCodeApp(ToolCallingProvider(outside), cwd=workspace)
+    target = workspace / "inside.txt"
+    app = KCodeApp(ToolCallingProvider(target), cwd=workspace)
     async with app.run_test(size=(100, 30)) as pilot:
         await submit(app, pilot, "在外部写文件")
         await pilot.pause(0.1)
         assert isinstance(app.screen, ApprovalScreen)
-        await pilot.click("#deny")
+        await pilot.press("down", "down", "enter")
         await pilot.pause(0.15)
-        assert not outside.exists()
-        assert app.query_one(ToolCallWidget).query_one(".tool-status").render().plain.startswith("⛔ 已拒绝")
+        assert not target.exists()
+        assert (
+            app.query_one(ToolCallWidget)
+            .query_one(".tool-status")
+            .render()
+            .plain.startswith("⛔ 已拒绝")
+        )
         assert list(app.query(AssistantResponse))[-1].answer_text == "写入已被用户拒绝。"
         assert app.conversation.snapshot()[0].assistant == "写入已被用户拒绝。"
 
@@ -260,17 +286,49 @@ async def test_external_write_approval_can_be_denied(tmp_path) -> None:
 async def test_ctrl_c_cancels_pending_approval(tmp_path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    outside = tmp_path / "outside.txt"
-    app = KCodeApp(ToolCallingProvider(outside), cwd=workspace)
+    target = workspace / "inside.txt"
+    app = KCodeApp(ToolCallingProvider(target), cwd=workspace)
     async with app.run_test(size=(100, 30)) as pilot:
         await submit(app, pilot, "在外部写文件")
         await pilot.pause(0.1)
         assert isinstance(app.screen, ApprovalScreen)
         await app.action_interrupt()
         await pilot.pause(0.15)
-        assert not outside.exists()
+        assert not target.exists()
         assert app.query_one("#prompt", Input).disabled is False
         assert "用户已取消当前任务。" in list(app.query(AssistantResponse))[-1].answer_text
+
+
+async def test_escape_cancels_pending_approval(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "inside.txt"
+    app = KCodeApp(ToolCallingProvider(target), cwd=workspace)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await submit(app, pilot, "在项目内写文件")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, ApprovalScreen)
+        await pilot.press("escape")
+        await pilot.pause(0.15)
+        assert not target.exists()
+        assert app.query_one("#prompt", Input).disabled is False
+        assert "用户已取消当前任务。" in list(app.query(AssistantResponse))[-1].answer_text
+
+
+async def test_approval_number_two_persists_exact_local_rule(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "inside.txt"
+    app = KCodeApp(ToolCallingProvider(target), cwd=workspace)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await submit(app, pilot, "在项目内写文件")
+        await pilot.pause(0.1)
+        assert isinstance(app.screen, ApprovalScreen)
+        await pilot.press("2")
+        await pilot.pause(0.2)
+        assert target.read_text(encoding="utf-8") == "blocked"
+        local = workspace / ".kcode" / "permissions.local.yaml"
+        assert "Write(inside.txt)" in local.read_text(encoding="utf-8")
 
 
 class SixToolProvider:
@@ -317,7 +375,11 @@ class SixToolProvider:
 
 
 async def test_six_tools_execute_and_render_clear_success_cards(tmp_path) -> None:
-    app = KCodeApp(SixToolProvider(), cwd=tmp_path)
+    app = KCodeApp(
+        SixToolProvider(),
+        cwd=tmp_path,
+        session=AgentSession(PermissionMode.BYPASS_PERMISSIONS),
+    )
     expected_labels = ("新建文件", "读取文件", "修改文件", "执行命令", "查找文件", "搜索代码")
     async with app.run_test(size=(110, 40)) as pilot:
         for index, label in enumerate(expected_labels, 1):
@@ -362,8 +424,7 @@ async def test_multi_tool_loop_renders_ordered_cards_and_new_model_step(tmp_path
         responses = list(app.query(AssistantResponse))
         assert [card.call.id for card in cards] == ["read-a", "read-b"]
         assert all(
-            card.query_one(".tool-status").render().plain.startswith("✓ 执行成功")
-            for card in cards
+            card.query_one(".tool-status").render().plain.startswith("✓ 执行成功") for card in cards
         )
         assert len(responses) == 2
         assert responses[-1].answer_text == "两个文件都读取完成"

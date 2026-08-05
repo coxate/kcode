@@ -1,9 +1,13 @@
 from types import SimpleNamespace
 
 from kcode.config import ProviderConfig
-from kcode.conversation import ChatMessage
+from kcode.conversation import (
+    ChatMessage,
+    EnvironmentMessage,
+    StableSystemMessage,
+    SystemReminderMessage,
+)
 from kcode.events import (
-    StreamCompleted,
     TextDelta,
     ThinkingDelta,
     TokenUsage,
@@ -93,11 +97,22 @@ async def test_anthropic_tool_fragments_and_continuation_state() -> None:
         ),
         SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason="tool_use")),
     ]
-    block = SimpleNamespace(model_dump=lambda mode: {"type": "thinking", "thinking": "summary", "signature": "sig"})
-    redacted = SimpleNamespace(model_dump=lambda mode: {"type": "redacted_thinking", "data": "opaque"})
+    block = SimpleNamespace(
+        model_dump=lambda mode: {"type": "thinking", "thinking": "summary", "signature": "sig"}
+    )
+    redacted = SimpleNamespace(
+        model_dump=lambda mode: {"type": "redacted_thinking", "data": "opaque"}
+    )
     messages = FakeMessages(events, SimpleNamespace(content=[block, redacted]))
     provider = AnthropicProvider(
-        ProviderConfig(name="claude", protocol="anthropic", model="m", base_url="https://test", api_key="x", thinking=True),
+        ProviderConfig(
+            name="claude",
+            protocol="anthropic",
+            model="m",
+            base_url="https://test",
+            api_key="x",
+            thinking=True,
+        ),
         SimpleNamespace(messages=messages),
     )
     definition = ToolDefinition("read_file", "Read", {"type": "object"})
@@ -137,6 +152,28 @@ async def test_anthropic_reports_final_usage() -> None:
     assert result[-2] == UsageReported(TokenUsage(20, 5, 25, 3, 7))
 
 
+async def test_anthropic_usage_preserves_zero_and_rejects_invalid_values() -> None:
+    usage = SimpleNamespace(
+        input_tokens=0,
+        output_tokens=True,
+        cache_creation_input_tokens=-1,
+        cache_read_input_tokens="7",
+    )
+    messages = FakeMessages([], SimpleNamespace(content=[], usage=usage))
+    provider = AnthropicProvider(
+        ProviderConfig(
+            name="claude",
+            protocol="anthropic",
+            model="m",
+            base_url="https://test",
+            api_key="x",
+        ),
+        SimpleNamespace(messages=messages),
+    )
+    result = [event async for event in provider.stream([ChatMessage("user", "hi")])]
+    assert UsageReported(TokenUsage(0, None, None, None, None)) in result
+
+
 async def test_anthropic_streams_multiple_tool_uses() -> None:
     events = [
         SimpleNamespace(
@@ -153,7 +190,9 @@ async def test_anthropic_streams_multiple_tool_uses() -> None:
     ]
     messages = FakeMessages(events, SimpleNamespace(content=[]))
     provider = AnthropicProvider(
-        ProviderConfig(name="claude", protocol="anthropic", model="m", base_url="https://test", api_key="x"),
+        ProviderConfig(
+            name="claude", protocol="anthropic", model="m", base_url="https://test", api_key="x"
+        ),
         SimpleNamespace(messages=messages),
     )
     result = [event async for event in provider.stream([ChatMessage("user", "tools")])]
@@ -162,3 +201,33 @@ async def test_anthropic_streams_multiple_tool_uses() -> None:
         (0, "a", "read_file"),
         (1, "b", "find_files"),
     ]
+
+
+async def test_anthropic_preserves_system_blocks_and_marks_only_stable() -> None:
+    messages = FakeMessages([])
+    provider = AnthropicProvider(
+        ProviderConfig(
+            name="claude",
+            protocol="anthropic",
+            model="m",
+            base_url="https://test",
+            api_key="x",
+        ),
+        SimpleNamespace(messages=messages),
+    )
+    request_messages = [
+        StableSystemMessage("stable"),
+        EnvironmentMessage("dynamic"),
+        SystemReminderMessage("plan_mode", "remember"),
+        ChatMessage("user", "hi"),
+    ]
+    _ = [event async for event in provider.stream(request_messages)]
+    system = messages.request["system"]
+    assert system[0] == {
+        "type": "text",
+        "text": "stable",
+        "cache_control": {"type": "ephemeral"},
+    }
+    assert system[1] == {"type": "text", "text": "dynamic"}
+    assert "<system-reminder>" in system[2]["text"]
+    assert "cache_control" not in system[2]

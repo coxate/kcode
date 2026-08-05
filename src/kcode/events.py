@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import TypeAlias
 
 from kcode.conversation import ProviderContinuationState
-from kcode.session import AgentMode
+from kcode.permissions.models import PermissionMode
 from kcode.tools.base import ApprovalRequest, ToolCall, ToolResult
 
 
@@ -77,7 +77,7 @@ class AgentStopReason(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class AgentProgress:
-    mode: AgentMode
+    mode: PermissionMode
     iteration: int
     max_iterations: int
     phase: AgentPhase
@@ -129,7 +129,9 @@ class TurnCompleted:
     committed: bool
 
 
-ProviderEvent: TypeAlias = TextDelta | ThinkingDelta | ToolCallDelta | UsageReported | StreamCompleted
+ProviderEvent: TypeAlias = (
+    TextDelta | ThinkingDelta | ToolCallDelta | UsageReported | StreamCompleted
+)
 AgentEvent: TypeAlias = (
     ProviderEvent
     | ToolCallReady

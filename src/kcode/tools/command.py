@@ -4,11 +4,17 @@ import asyncio
 import os
 import shlex
 import signal
-from pathlib import Path
 from typing import cast
 
-from kcode.tools.base import RunCommandArgs, ToolArguments, ToolContext, ToolExecutionError, ToolResult, ToolSpec
-from kcode.tools.policy import resolve_tool_path
+from kcode.tools.base import (
+    RunCommandArgs,
+    ToolArguments,
+    ToolContext,
+    ToolExecutionError,
+    ToolResult,
+    ToolSpec,
+)
+from kcode.tools.paths import resolve_tool_path
 
 
 def _truncate(value: bytes, limit: int) -> tuple[str, bool, int]:
@@ -41,7 +47,9 @@ async def _terminate(process: asyncio.subprocess.Process) -> None:
 class RunCommandTool:
     spec = ToolSpec(
         "run_command",
-        "Run a command and return its exit code, stdout, and stderr.",
+        "Run a command and return its exit code, stdout, and stderr. Use only when no "
+        "purpose-built tool covers the operation; never substitute it for read_file, "
+        "find_files, search_code, write_file, or edit_file.",
         RunCommandArgs,
         None,
     )
@@ -50,7 +58,9 @@ class RunCommandTool:
         args = cast(RunCommandArgs, arguments)
         cwd = resolve_tool_path(args.cwd or ".", context, existing=True)
         if not cwd.is_dir():
-            raise ToolExecutionError("not_a_directory", "Command cwd is not a directory.", path=str(cwd))
+            raise ToolExecutionError(
+                "not_a_directory", "Command cwd is not a directory.", path=str(cwd)
+            )
         creationflags = 0
         kwargs: dict[str, object] = {}
         if os.name == "posix":
@@ -70,10 +80,14 @@ class RunCommandTool:
             argv = shlex.split(args.command, posix=os.name != "nt")
             process = await asyncio.create_subprocess_exec(*argv, **process_options)
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=args.timeout_seconds)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=args.timeout_seconds
+            )
         except asyncio.TimeoutError:
             await _terminate(process)
-            raise ToolExecutionError("timeout", "Command exceeded its timeout.", timeout_seconds=args.timeout_seconds)
+            raise ToolExecutionError(
+                "timeout", "Command exceeded its timeout.", timeout_seconds=args.timeout_seconds
+            )
         except asyncio.CancelledError:
             await _terminate(process)
             raise

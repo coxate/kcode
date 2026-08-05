@@ -6,25 +6,42 @@ import threading
 import time
 from contextlib import suppress
 from dataclasses import replace
-from typing import Any
 
 from pydantic import ValidationError
 
+from kcode.permissions.commands import TOOL_INFO, redact_preview, tool_permission_info
+from kcode.permissions.config import LocalPermissionStore
+from kcode.permissions.engine import PermissionEngine
+from kcode.permissions.models import (
+    ApprovalChoice,
+    PermissionMode,
+    PermissionPersistenceError,
+    PermissionSource,
+    PermissionVerdict,
+)
 from kcode.tools.base import (
     ApprovalHandler,
+    ApprovalRequest,
     JSONValue,
     PreparedToolCall,
     RunCommandArgs,
     ToolCall,
     ToolContext,
+    ToolEffect,
     ToolError,
     ToolExecutionError,
-    ToolEffect,
     ToolResult,
 )
-from kcode.session import AgentMode
-from kcode.tools.policy import ToolPolicy
 from kcode.tools.registry import ToolRegistry
+
+DENIAL_CODES = {
+    PermissionSource.BLACKLIST: "dangerous_command",
+    PermissionSource.PLAN_MODE: "plan_mode_denied",
+    PermissionSource.SANDBOX: "path_outside_workspace",
+    PermissionSource.LOCAL_RULE: "permission_rule_denied",
+    PermissionSource.PROJECT_RULE: "permission_rule_denied",
+    PermissionSource.USER_RULE: "permission_rule_denied",
+}
 
 
 def _redact_value(value: JSONValue, secrets: tuple[str, ...]) -> JSONValue:
@@ -54,15 +71,21 @@ def redact_result(result: ToolResult, secrets: tuple[str, ...]) -> ToolResult:
 
 
 class ToolExecutor:
-    def __init__(self, registry: ToolRegistry, policy: ToolPolicy) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        permissions: PermissionEngine,
+        local_store: LocalPermissionStore,
+    ) -> None:
         self.registry = registry
-        self.policy = policy
+        self.permissions = permissions
+        self.local_store = local_store
 
     def prepare(
         self,
         call: ToolCall,
         context: ToolContext,
-        mode: AgentMode = AgentMode.DO,
+        mode: PermissionMode = PermissionMode.DEFAULT,
     ) -> PreparedToolCall:
         tool = self.registry.get(call.name)
         if tool is None:
@@ -70,7 +93,7 @@ class ToolExecutor:
                 call,
                 None,
                 None,
-                ToolEffect.READ_ONLY,
+                ToolEffect.SIDE_EFFECT,
                 error=ToolResult.failure(
                     "unknown_tool", f"Unknown tool: {call.name}", details={"tool": call.name}
                 ),
@@ -104,34 +127,60 @@ class ToolExecutor:
                 ),
             )
         try:
-            effect = tool.spec.effect
-            if effect is None:
-                command = str(getattr(arguments, "command"))
-                effect = (
-                    ToolEffect.READ_ONLY
-                    if self.policy.is_read_only_command(command)
-                    else ToolEffect.SIDE_EFFECT
+            if call.name not in TOOL_INFO:
+                effect = tool.spec.effect or ToolEffect.SIDE_EFFECT
+                return PreparedToolCall(
+                    call,
+                    tool,
+                    arguments,
+                    effect,
+                    approval=ApprovalRequest(
+                        call.id,
+                        call.name,
+                        redact_preview(call.arguments_json, context.sensitive_values),
+                        "The tool category is unknown and requires user confirmation.",
+                        call.name,
+                    ),
                 )
-            if mode == AgentMode.PLAN and effect == ToolEffect.SIDE_EFFECT:
+            effect = self.permissions.effect_for(call, arguments, mode)
+            decision = self.permissions.evaluate(call, arguments, context, mode)
+            if decision.verdict == PermissionVerdict.DENY:
                 return PreparedToolCall(
                     call,
                     tool,
                     arguments,
                     effect,
                     error=ToolResult.failure(
-                        "plan_mode_denied",
-                        "Plan Mode only allows read-only tools and commands.",
+                        DENIAL_CODES.get(decision.source, "permission_denied"),
+                        decision.reason,
                         status="denied",
-                        details={"tool": call.name},
+                        details={
+                            "tool": call.name,
+                            "source": decision.source.value,
+                            **(
+                                {"rule": decision.matched_rule}
+                                if decision.matched_rule is not None
+                                else {}
+                            ),
+                        },
                     ),
                 )
-            decision = self.policy.decision(call, arguments, context)
+            approval = None
+            if decision.verdict == PermissionVerdict.ASK:
+                info = tool_permission_info(call.name, arguments)
+                approval = ApprovalRequest(
+                    call.id,
+                    info.friendly_name,
+                    redact_preview(info.raw_value, context.sensitive_values),
+                    decision.reason,
+                    decision.permanent_rule or info.friendly_name,
+                )
             return PreparedToolCall(
                 call,
                 tool,
                 arguments,
                 effect,
-                approval=decision.approval,
+                approval=approval,
             )
         except ToolExecutionError as exc:
             return PreparedToolCall(
@@ -161,10 +210,9 @@ class ToolExecutor:
     ) -> ToolResult:
         started = time.monotonic()
         if prepared.error is not None:
-            return prepared.error
+            return redact_result(prepared.error, context.sensitive_values)
         assert prepared.tool is not None and prepared.arguments is not None
         try:
-            approved_shell = False
             if prepared.approval is not None:
                 approval_task = asyncio.create_task(approve(prepared.approval))
                 cancel_task = (
@@ -187,17 +235,45 @@ class ToolExecutor:
                     cancel_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await cancel_task
-                if not await approval_task:
+                choice = await approval_task
+                if choice is True:
+                    choice = ApprovalChoice.ALLOW_ONCE
+                elif choice is False:
+                    choice = ApprovalChoice.DENY
+                if choice not in {ApprovalChoice.ALLOW_ONCE, ApprovalChoice.ALLOW_ALWAYS}:
                     return ToolResult.failure(
                         "permission_denied",
                         "The user denied this tool call.",
                         status="denied",
                         details={"tool": prepared.call.name},
                     )
-                approved_shell = prepared.call.name == "run_command"
+                if choice == ApprovalChoice.ALLOW_ALWAYS:
+                    if any(
+                        secret and secret in prepared.approval.permanent_rule
+                        for secret in context.sensitive_values
+                    ):
+                        return ToolResult.failure(
+                            "permission_persist_failed",
+                            "A permanent rule containing a sensitive value was not saved.",
+                            details={"tool": prepared.call.name},
+                        )
+                    try:
+                        layer = await asyncio.to_thread(
+                            self.local_store.append_allow,
+                            prepared.approval.permanent_rule,
+                        )
+                    except PermissionPersistenceError:
+                        return ToolResult.failure(
+                            "permission_persist_failed",
+                            "The permanent permission rule could not be saved safely.",
+                            details={"tool": prepared.call.name},
+                        )
+                    self.permissions.replace_local_layer(layer)
             thread_cancel_event = threading.Event()
             execution_context = replace(
-                context, cancel_event=thread_cancel_event, use_shell=approved_shell
+                context,
+                cancel_event=thread_cancel_event,
+                use_shell=prepared.call.name == "run_command",
             )
             timeout = (
                 prepared.arguments.timeout_seconds
@@ -210,13 +286,21 @@ class ToolExecutor:
             cancellation_task = (
                 asyncio.create_task(cancel_event.wait()) if cancel_event is not None else None
             )
-            waiters = (execution_task,) if cancellation_task is None else (execution_task, cancellation_task)
+            waiters = (
+                (execution_task,)
+                if cancellation_task is None
+                else (execution_task, cancellation_task)
+            )
             done, _ = await asyncio.wait(
                 waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
             )
             if execution_task in done:
                 result = await execution_task
-            elif cancellation_task is not None and cancellation_task in done and cancel_event.is_set():
+            elif (
+                cancellation_task is not None
+                and cancellation_task in done
+                and cancel_event.is_set()
+            ):
                 thread_cancel_event.set()
                 if prepared.call.name in {"write_file", "edit_file"}:
                     result = await execution_task
@@ -236,7 +320,10 @@ class ToolExecutor:
                 with suppress(asyncio.CancelledError):
                     await execution_task
                 result = ToolResult.failure(
-                    "timeout", "Tool execution exceeded its timeout.", status="timeout", details={"seconds": timeout}
+                    "timeout",
+                    "Tool execution exceeded its timeout.",
+                    status="timeout",
+                    details={"seconds": timeout},
                 )
             if cancellation_task is not None:
                 cancellation_task.cancel()
@@ -247,7 +334,13 @@ class ToolExecutor:
         except asyncio.CancelledError:
             raise
         except ToolExecutionError as exc:
-            status = "timeout" if exc.code == "timeout" else "cancelled" if exc.code == "cancelled" else "error"
+            status = (
+                "timeout"
+                if exc.code == "timeout"
+                else "cancelled"
+                if exc.code == "cancelled"
+                else "error"
+            )
             result = ToolResult.failure(
                 exc.code,
                 str(exc),
@@ -275,5 +368,6 @@ class ToolExecutor:
         call: ToolCall,
         context: ToolContext,
         approve: ApprovalHandler,
+        mode: PermissionMode = PermissionMode.DEFAULT,
     ) -> ToolResult:
-        return await self.execute_prepared(self.prepare(call, context), context, approve)
+        return await self.execute_prepared(self.prepare(call, context, mode), context, approve)

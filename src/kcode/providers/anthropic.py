@@ -11,8 +11,11 @@ from kcode.conversation import (
     AssistantMessage,
     ChatMessage,
     ConversationMessage,
+    EnvironmentMessage,
     ProviderContinuationState,
+    StableSystemMessage,
     SystemMessage,
+    SystemReminderMessage,
     ToolResultMessage,
     UserMessage,
 )
@@ -29,12 +32,32 @@ from kcode.events import (
 from kcode.tools.base import ToolDefinition
 
 
-def _serialize(messages: Sequence[ConversationMessage]) -> tuple[str | None, list[dict[str, Any]]]:
-    systems: list[str] = []
+def _optional_nonnegative_int(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _serialize(
+    messages: Sequence[ConversationMessage],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    systems: list[dict[str, Any]] = []
     output: list[dict[str, Any]] = []
     for message in messages:
-        if isinstance(message, SystemMessage) or isinstance(message, ChatMessage) and message.role == "system":
-            systems.append(message.content)
+        if isinstance(message, StableSystemMessage):
+            systems.append(
+                {
+                    "type": "text",
+                    "text": message.content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            )
+        elif isinstance(message, EnvironmentMessage):
+            systems.append({"type": "text", "text": message.content})
+        elif isinstance(message, SystemReminderMessage):
+            systems.append({"type": "text", "text": message.render()})
+        elif isinstance(message, SystemMessage) or (
+            isinstance(message, ChatMessage) and message.role == "system"
+        ):
+            systems.append({"type": "text", "text": message.content})
         elif isinstance(message, ChatMessage):
             output.append({"role": message.role, "content": message.content})
         elif isinstance(message, UserMessage):
@@ -67,7 +90,7 @@ def _serialize(messages: Sequence[ConversationMessage]) -> tuple[str | None, lis
                 output[-1]["content"].append(block)
             else:
                 output.append({"role": "user", "content": [block]})
-    return "\n\n".join(systems) or None, output
+    return systems, output
 
 
 class AnthropicProvider:
@@ -92,14 +115,22 @@ class AnthropicProvider:
         tool_choice: Literal["auto", "none"] = "auto",
     ) -> AsyncIterator[ProviderEvent]:
         system, serialized = _serialize(messages)
-        request: dict[str, Any] = {"model": self.config.model, "max_tokens": 4096, "messages": serialized}
+        request: dict[str, Any] = {
+            "model": self.config.model,
+            "max_tokens": 4096,
+            "messages": serialized,
+        }
         if system:
             request["system"] = system
         if self.config.thinking:
             request["thinking"] = {"type": "enabled", "budget_tokens": 1024}
         if tools:
             request["tools"] = [
-                {"name": tool.name, "description": tool.description, "input_schema": dict(tool.parameters)}
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": dict(tool.parameters),
+                }
                 for tool in tools
             ]
             request["tool_choice"] = {"type": tool_choice}
@@ -133,7 +164,9 @@ class AnthropicProvider:
                                 arguments_fragment=getattr(delta, "partial_json", ""),
                             )
                     elif event_type == "message_delta":
-                        stop_reason = getattr(getattr(event, "delta", None), "stop_reason", stop_reason)
+                        stop_reason = getattr(
+                            getattr(event, "delta", None), "stop_reason", stop_reason
+                        )
                 get_final = getattr(stream, "get_final_message", None)
                 if get_final is not None:
                     final = await get_final()
@@ -144,8 +177,12 @@ class AnthropicProvider:
                     state = ProviderContinuationState("anthropic", blocks)
                     usage = getattr(final, "usage", None)
                     if usage is not None:
-                        input_tokens = getattr(usage, "input_tokens", None)
-                        output_tokens = getattr(usage, "output_tokens", None)
+                        input_tokens = _optional_nonnegative_int(
+                            getattr(usage, "input_tokens", None)
+                        )
+                        output_tokens = _optional_nonnegative_int(
+                            getattr(usage, "output_tokens", None)
+                        )
                         usage_snapshot = TokenUsage(
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
@@ -154,11 +191,11 @@ class AnthropicProvider:
                                 if input_tokens is not None and output_tokens is not None
                                 else None
                             ),
-                            cache_creation_input_tokens=getattr(
-                                usage, "cache_creation_input_tokens", None
+                            cache_creation_input_tokens=_optional_nonnegative_int(
+                                getattr(usage, "cache_creation_input_tokens", None)
                             ),
-                            cache_read_input_tokens=getattr(
-                                usage, "cache_read_input_tokens", None
+                            cache_read_input_tokens=_optional_nonnegative_int(
+                                getattr(usage, "cache_read_input_tokens", None)
                             ),
                         )
             if usage_snapshot is not None:
@@ -167,10 +204,16 @@ class AnthropicProvider:
         except ProviderError:
             raise
         except anthropic.AuthenticationError as exc:
-            raise ProviderError(ProviderErrorKind.AUTHENTICATION, "Anthropic authentication failed.") from exc
+            raise ProviderError(
+                ProviderErrorKind.AUTHENTICATION, "Anthropic authentication failed."
+            ) from exc
         except anthropic.RateLimitError as exc:
-            raise ProviderError(ProviderErrorKind.RATE_LIMIT, "Anthropic rate limit reached.") from exc
+            raise ProviderError(
+                ProviderErrorKind.RATE_LIMIT, "Anthropic rate limit reached."
+            ) from exc
         except (anthropic.APIConnectionError, anthropic.APITimeoutError) as exc:
             raise ProviderError(ProviderErrorKind.NETWORK, "Cannot connect to Anthropic.") from exc
         except anthropic.APIError as exc:
-            raise ProviderError(ProviderErrorKind.INVALID_RESPONSE, "Anthropic returned an invalid response.") from exc
+            raise ProviderError(
+                ProviderErrorKind.INVALID_RESPONSE, "Anthropic returned an invalid response."
+            ) from exc

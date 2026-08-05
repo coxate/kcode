@@ -43,9 +43,10 @@ def _arguments_summary(call: ToolCall) -> str:
         "new_text": "替换为",
         "content": "内容预览",
     }
-    return "\n".join(
-        f"{labels.get(key, key)}：{_short(value)}" for key, value in arguments.items()
-    ) or "无参数"
+    return (
+        "\n".join(f"{labels.get(key, key)}：{_short(value)}" for key, value in arguments.items())
+        or "无参数"
+    )
 
 
 def _result_summary(call: ToolCall, result: ToolResult) -> str:
@@ -70,7 +71,8 @@ def _result_summary(call: ToolCall, result: ToolResult) -> str:
     elif call.name == "search_code":
         detail = f"目录：{data.get('root')}\n找到：{len(data.get('matches', []))} 处匹配"
     elif call.name == "run_command":
-        detail = f"退出码：{data.get('exit_code')}\n输出：{_short(data.get('stdout', ''), 500) or '（无）'}"
+        output = _short(data.get("stdout", ""), 500) or "（无）"
+        detail = f"退出码：{data.get('exit_code')}\n输出：{output}"
     else:
         detail = _short(result.to_json(), 700)
     suffix = "\n结果已截断" if result.truncated else ""
@@ -112,9 +114,7 @@ class AssistantResponse(Vertical):
 
     def set_iteration(self, iteration: int) -> None:
         self.iteration = iteration
-        self.query_one(".message-role", Label).update(
-            f"KCode · 模型回复 · 第 {iteration} 轮"
-        )
+        self.query_one(".message-role", Label).update(f"KCode · 模型回复 · 第 {iteration} 轮")
 
     def update_thinking(self, text: str) -> None:
         self.thinking_text = text

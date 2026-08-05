@@ -12,13 +12,13 @@ from kcode.tools.base import (
     ReadFileArgs,
     ToolArguments,
     ToolContext,
-    ToolExecutionError,
     ToolEffect,
+    ToolExecutionError,
     ToolResult,
     ToolSpec,
     WriteFileArgs,
 )
-from kcode.tools.policy import resolve_tool_path
+from kcode.tools.paths import resolve_tool_path
 
 
 def _ensure_regular(path: Path) -> os.stat_result:
@@ -50,7 +50,10 @@ def _read(arguments: ReadFileArgs, context: ToolContext) -> ToolResult:
                         line=current,
                         limit_bytes=context.limits.max_bytes,
                     )
-                if len(selected) >= arguments.max_lines or used + len(encoded) > context.limits.max_bytes:
+                if (
+                    len(selected) >= arguments.max_lines
+                    or used + len(encoded) > context.limits.max_bytes
+                ):
                     truncated = True
                     next_line = current
                     break
@@ -59,7 +62,9 @@ def _read(arguments: ReadFileArgs, context: ToolContext) -> ToolResult:
                 if context.cancel_event and context.cancel_event.is_set():
                     raise ToolExecutionError("cancelled", "File reading was cancelled.")
     except UnicodeDecodeError as exc:
-        raise ToolExecutionError("decode_error", "File is not valid UTF-8 text.", path=str(path)) from exc
+        raise ToolExecutionError(
+            "decode_error", "File is not valid UTF-8 text.", path=str(path)
+        ) from exc
     end_line = arguments.start_line + len(selected) - 1 if selected else arguments.start_line - 1
     return ToolResult.success(
         {
@@ -81,7 +86,9 @@ def _temp_path(parent: Path) -> tuple[int, Path]:
 def _write(arguments: WriteFileArgs, context: ToolContext) -> ToolResult:
     target = resolve_tool_path(arguments.path, context, existing=False)
     if target.exists() or target.is_symlink():
-        raise ToolExecutionError("already_exists", "write_file never overwrites an existing path.", path=str(target))
+        raise ToolExecutionError(
+            "already_exists", "write_file never overwrites an existing path.", path=str(target)
+        )
     fd, temporary = _temp_path(target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
@@ -91,8 +98,12 @@ def _write(arguments: WriteFileArgs, context: ToolContext) -> ToolResult:
         try:
             os.link(temporary, target)
         except FileExistsError as exc:
-            raise ToolExecutionError("already_exists", "The target was created concurrently.", path=str(target)) from exc
-        return ToolResult.success({"path": str(target), "bytes_written": len(arguments.content.encode("utf-8"))})
+            raise ToolExecutionError(
+                "already_exists", "The target was created concurrently.", path=str(target)
+            ) from exc
+        return ToolResult.success(
+            {"path": str(target), "bytes_written": len(arguments.content.encode("utf-8"))}
+        )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -103,7 +114,9 @@ def _edit(arguments: EditFileArgs, context: ToolContext) -> ToolResult:
     try:
         source = target.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
-        raise ToolExecutionError("decode_error", "File is not valid UTF-8 text.", path=str(target)) from exc
+        raise ToolExecutionError(
+            "decode_error", "File is not valid UTF-8 text.", path=str(target)
+        ) from exc
     count = source.count(arguments.old_text)
     if count != 1:
         raise ToolExecutionError(
@@ -124,7 +137,9 @@ def _edit(arguments: EditFileArgs, context: ToolContext) -> ToolResult:
         identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
         identity_now = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
         if identity_before != identity_now:
-            raise ToolExecutionError("file_changed", "The file changed while it was being edited.", path=str(target))
+            raise ToolExecutionError(
+                "file_changed", "The file changed while it was being edited.", path=str(target)
+            )
         os.replace(temporary, target)
         return ToolResult.success({"path": str(target), "replacements": 1})
     finally:
@@ -132,7 +147,12 @@ def _edit(arguments: EditFileArgs, context: ToolContext) -> ToolResult:
 
 
 class ReadFileTool:
-    spec = ToolSpec("read_file", "Read a UTF-8 text file, optionally by line range.", ReadFileArgs)
+    spec = ToolSpec(
+        "read_file",
+        "Read a UTF-8 text file, optionally by line range. Use this purpose-built tool "
+        "instead of run_command, and always read an existing file before editing it.",
+        ReadFileArgs,
+    )
 
     async def execute(self, arguments: ToolArguments, context: ToolContext) -> ToolResult:
         return await asyncio.to_thread(_read, cast(ReadFileArgs, arguments), context)
@@ -153,7 +173,8 @@ class WriteFileTool:
 class EditFileTool:
     spec = ToolSpec(
         "edit_file",
-        "Replace old_text only when it occurs exactly once.",
+        "Edit an existing UTF-8 text file after reading it with read_file in the current "
+        "task. Replaces old_text only when it occurs exactly once.",
         EditFileArgs,
         ToolEffect.SIDE_EFFECT,
     )

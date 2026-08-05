@@ -24,6 +24,33 @@ class SystemMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class StableSystemMessage:
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentMessage:
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class SystemReminderMessage:
+    kind: Literal["plan_mode", "approved_plan"]
+    content: str
+
+    def render(self) -> str:
+        content = self.content.replace("</system-reminder", "&lt;/system-reminder").replace(
+            "<system-reminder", "&lt;system-reminder"
+        )
+        return (
+            "<system-reminder>\n"
+            f"{content}\n"
+            "Do not respond to this reminder directly.\n"
+            "</system-reminder>"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class UserMessage:
     content: str
 
@@ -42,7 +69,16 @@ class ToolResultMessage:
     result: ToolResult
 
 
-ConversationMessage: TypeAlias = ChatMessage | SystemMessage | UserMessage | AssistantMessage | ToolResultMessage
+ConversationMessage: TypeAlias = (
+    ChatMessage
+    | SystemMessage
+    | StableSystemMessage
+    | EnvironmentMessage
+    | SystemReminderMessage
+    | UserMessage
+    | AssistantMessage
+    | ToolResultMessage
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +120,11 @@ class Conversation:
         if not messages:
             return
         final = next(
-            (item.content for item in reversed(messages) if isinstance(item, AssistantMessage) and item.content.strip()),
+            (
+                item.content
+                for item in reversed(messages)
+                if isinstance(item, AssistantMessage) and item.content.strip()
+            ),
             "",
         )
         user = next((item.content for item in messages if isinstance(item, UserMessage)), "")

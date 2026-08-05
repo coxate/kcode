@@ -6,5 +6,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
-.kcode/
+.kcode/config.yaml
+.kcode/permissions.local.yaml
 .DS_Store

@@ -122,9 +122,7 @@ def load_config(
     candidates = [path for path in (user_path, project_path) if path is not None and path.is_file()]
     if not candidates:
         expected = project_path or user_path or Path(".kcode/config.yaml")
-        raise ConfigError(
-            f"No KCode config found. Create {expected} from config.example.yaml."
-        )
+        raise ConfigError(f"No KCode config found. Create {expected} from config.example.yaml.")
     loaded = [(path, _read_yaml(path)) for path in candidates]
     merged = _merge_configs(loaded)
     source_label = " then ".join(str(path) for path in candidates)
@@ -132,9 +130,7 @@ def load_config(
     try:
         for raw in merged["providers"]:
             raw = dict(raw)
-            raw["api_key"] = _expand_key(
-                raw.get("api_key"), path_label=source_label, environ=env
-            )
+            raw["api_key"] = _expand_key(raw.get("api_key"), path_label=source_label, environ=env)
             parsed = ProviderConfig.model_validate(raw)
             providers[parsed.name] = parsed
         active = merged["active_provider"]

@@ -1,7 +1,13 @@
 import asyncio
 
 from kcode.config import AgentConfig
-from kcode.conversation import Conversation, SystemMessage, ToolResultMessage
+from kcode.conversation import (
+    Conversation,
+    EnvironmentMessage,
+    StableSystemMessage,
+    SystemReminderMessage,
+    ToolResultMessage,
+)
 from kcode.errors import ProviderError, ProviderErrorKind
 from kcode.events import (
     AgentStopped,
@@ -16,15 +22,32 @@ from kcode.events import (
     UsageReported,
 )
 from kcode.orchestration import AgentRunner
+from kcode.permissions import (
+    LocalPermissionStore,
+    PermissionEngine,
+    PermissionMode,
+    empty_permission_settings,
+)
 from kcode.session import AgentMode, AgentSession
 from kcode.tools.base import ToolContext
 from kcode.tools.executor import ToolExecutor
-from kcode.tools.policy import ToolPolicy
 from kcode.tools.registry import create_default_registry
 
 
 async def allow(_request):
     return True
+
+
+class FakeEnvironmentCollector:
+    def __init__(self):
+        self.calls = 0
+
+    async def collect(self, cwd, *, app_version, model):
+        self.calls += 1
+        return EnvironmentMessage(
+            f"<environment_context>\nWorking directory: {cwd}\nModel: {model}\n"
+            "</environment_context>"
+        )
 
 
 class ScriptedProvider:
@@ -44,16 +67,22 @@ class ScriptedProvider:
             yield event
 
 
-def make_runner(tmp_path, provider, *, config=None, conversation=None):
+def make_runner(tmp_path, provider, *, config=None, conversation=None, environment_collector=None):
     registry = create_default_registry()
+    settings = empty_permission_settings(tmp_path)
     return AgentRunner(
         provider,
         conversation or Conversation(),
         registry,
-        ToolExecutor(registry, ToolPolicy(tmp_path)),
+        ToolExecutor(
+            registry,
+            PermissionEngine(settings),
+            LocalPermissionStore(settings.layers[0].path),
+        ),
         ToolContext(tmp_path),
         allow,
         config,
+        environment_collector=environment_collector or FakeEnvironmentCollector(),
     )
 
 
@@ -62,9 +91,23 @@ async def test_agent_loops_three_tools_then_completes(tmp_path) -> None:
     target.write_text("before", encoding="utf-8")
     provider = ScriptedProvider(
         [
-            [ToolCallDelta(0, "read-1", "read_file", '{"path":"note.txt"}'), StreamCompleted("tool_calls")],
-            [ToolCallDelta(0, "edit-1", "edit_file", '{"path":"note.txt","old_text":"before","new_text":"after"}'), StreamCompleted("tool_calls")],
-            [ToolCallDelta(0, "read-2", "read_file", '{"path":"note.txt"}'), StreamCompleted("tool_calls")],
+            [
+                ToolCallDelta(0, "read-1", "read_file", '{"path":"note.txt"}'),
+                StreamCompleted("tool_calls"),
+            ],
+            [
+                ToolCallDelta(
+                    0,
+                    "edit-1",
+                    "edit_file",
+                    '{"path":"note.txt","old_text":"before","new_text":"after"}',
+                ),
+                StreamCompleted("tool_calls"),
+            ],
+            [
+                ToolCallDelta(0, "read-2", "read_file", '{"path":"note.txt"}'),
+                StreamCompleted("tool_calls"),
+            ],
             [
                 TextDelta("任务完成"),
                 UsageReported(TokenUsage(10, 2, 12)),
@@ -104,7 +147,9 @@ async def test_iteration_limit_stops_after_last_tool_checkpoint(tmp_path) -> Non
 
     assert len(provider.requests) == 2
     assert events[-1].reason == AgentStopReason.ITERATION_LIMIT
-    assert sum(isinstance(item, ToolResultMessage) for item in conversation.messages_snapshot()) == 2
+    assert (
+        sum(isinstance(item, ToolResultMessage) for item in conversation.messages_snapshot()) == 2
+    )
 
 
 async def test_two_unknown_only_rounds_stop_the_loop(tmp_path) -> None:
@@ -184,7 +229,10 @@ async def test_stream_error_keeps_completed_tool_checkpoint(tmp_path) -> None:
     target.write_text("value", encoding="utf-8")
     provider = ScriptedProvider(
         [
-            [ToolCallDelta(0, "read", "read_file", '{"path":"note.txt"}'), StreamCompleted("tool_calls")],
+            [
+                ToolCallDelta(0, "read", "read_file", '{"path":"note.txt"}'),
+                StreamCompleted("tool_calls"),
+            ],
             ProviderError(ProviderErrorKind.NETWORK, "offline"),
         ]
     )
@@ -198,7 +246,10 @@ async def test_stream_error_keeps_completed_tool_checkpoint(tmp_path) -> None:
 async def test_plan_mode_hides_writers_and_rejects_hallucinated_write(tmp_path) -> None:
     provider = ScriptedProvider(
         [
-            [ToolCallDelta(0, "write", "write_file", '{"path":"blocked.txt","content":"x"}'), StreamCompleted("tool_calls")],
+            [
+                ToolCallDelta(0, "write", "write_file", '{"path":"blocked.txt","content":"x"}'),
+                StreamCompleted("tool_calls"),
+            ],
             [TextDelta("只读计划"), StreamCompleted("stop")],
         ]
     )
@@ -221,15 +272,127 @@ async def test_plan_mode_hides_writers_and_rejects_hallucinated_write(tmp_path) 
 async def test_do_mode_consumes_plan_in_next_request(tmp_path) -> None:
     provider = ScriptedProvider([[TextDelta("done"), StreamCompleted("stop")]])
     session = AgentSession(AgentMode.DO, "先检查 README")
+    session.approve_plan()
     runner = make_runner(tmp_path, provider)
     _ = [event async for event in runner.run("执行", session)]
-    systems = [item.content for item in provider.requests[0][0] if isinstance(item, SystemMessage)]
-    assert any("先检查 README" in item for item in systems)
+    reminders = [
+        item for item in provider.requests[0][0] if isinstance(item, SystemReminderMessage)
+    ]
+    assert any("先检查 README" in item.content for item in reminders)
     assert session.latest_plan is None
 
 
+async def test_approved_plan_persists_only_for_current_task_and_environment_collects_once(
+    tmp_path,
+) -> None:
+    target = tmp_path / "note.txt"
+    target.write_text("value", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            [
+                ToolCallDelta(0, "read", "read_file", '{"path":"note.txt"}'),
+                StreamCompleted("tool_calls"),
+            ],
+            [TextDelta("first done"), StreamCompleted("stop")],
+            [TextDelta("second done"), StreamCompleted("stop")],
+        ]
+    )
+    collector = FakeEnvironmentCollector()
+    runner = make_runner(tmp_path, provider, environment_collector=collector)
+    session = AgentSession(AgentMode.DO, "Read the note")
+    session.approve_plan()
+
+    _ = [event async for event in runner.run("first", session)]
+    assert collector.calls == 1
+    first_reminders = [
+        tuple(item.content for item in request if isinstance(item, SystemReminderMessage))
+        for request, _, _ in provider.requests[:2]
+    ]
+    assert first_reminders[0] == first_reminders[1]
+    assert "Read the note" in first_reminders[0][0]
+
+    _ = [event async for event in runner.run("second", session)]
+    assert collector.calls == 2
+    assert not any(isinstance(item, SystemReminderMessage) for item in provider.requests[2][0])
+
+
+async def test_prompt_package_precedes_history_and_current(tmp_path) -> None:
+    provider = ScriptedProvider([[TextDelta("done"), StreamCompleted("stop")]])
+    runner = make_runner(tmp_path, provider)
+    _ = [event async for event in runner.run("request")]
+    request = provider.requests[0][0]
+    assert isinstance(request[0], StableSystemMessage)
+    assert isinstance(request[1], EnvironmentMessage)
+    assert request[-1].content == "request"
+
+
+async def test_plan_reminder_changes_at_fifth_iteration(tmp_path) -> None:
+    target = tmp_path / "note.txt"
+    target.write_text("value", encoding="utf-8")
+    tool_response = [
+        ToolCallDelta(0, "read", "read_file", '{"path":"note.txt"}'),
+        StreamCompleted("tool_calls"),
+    ]
+    provider = ScriptedProvider(
+        [
+            tool_response,
+            tool_response,
+            tool_response,
+            tool_response,
+            [TextDelta("plan"), StreamCompleted("stop")],
+        ]
+    )
+    runner = make_runner(
+        tmp_path,
+        provider,
+        config=AgentConfig(max_iterations=5, max_parallel_tools=2),
+    )
+    _ = [event async for event in runner.run("plan", AgentSession(AgentMode.PLAN))]
+    reminder_texts = []
+    for request, _, _ in provider.requests:
+        reminder = next(item for item in request if isinstance(item, SystemReminderMessage))
+        reminder_texts.append(reminder.content)
+    assert "Plan Mode is active" in reminder_texts[0]
+    assert all("Plan Mode remains active" in text for text in reminder_texts[1:4])
+    assert "Plan Mode is active" in reminder_texts[4]
+
+
+async def test_permission_mode_change_applies_on_next_model_iteration(tmp_path) -> None:
+    target = tmp_path / "note.txt"
+    target.write_text("value", encoding="utf-8")
+    session = AgentSession(AgentMode.PLAN)
+
+    class SwitchingProvider(ScriptedProvider):
+        async def stream(self, messages, tools=(), tool_choice="auto"):
+            async for event in super().stream(messages, tools, tool_choice):
+                yield event
+            if len(self.requests) == 1:
+                session.set_mode(PermissionMode.BYPASS_PERMISSIONS)
+
+    provider = SwitchingProvider(
+        [
+            [
+                ToolCallDelta(0, "read", "read_file", '{"path":"note.txt"}'),
+                StreamCompleted("tool_calls"),
+            ],
+            [TextDelta("done"), StreamCompleted("stop")],
+        ]
+    )
+    runner = make_runner(tmp_path, provider)
+    _ = [event async for event in runner.run("inspect", session)]
+    assert {tool.name for tool in provider.requests[0][1]} == {
+        "read_file",
+        "find_files",
+        "search_code",
+        "run_command",
+    }
+    assert len(provider.requests[1][1]) == 6
+    assert any(isinstance(item, SystemReminderMessage) for item in provider.requests[0][0])
+    assert not any(isinstance(item, SystemReminderMessage) for item in provider.requests[1][0])
+
+
 async def test_side_effect_approval_is_exposed_as_agent_event(tmp_path) -> None:
-    outside = tmp_path.parent / "agent-loop-outside.txt"
+    target = tmp_path / "agent-loop-inside.txt"
     provider = ScriptedProvider(
         [
             [
@@ -237,7 +400,7 @@ async def test_side_effect_approval_is_exposed_as_agent_event(tmp_path) -> None:
                     0,
                     "outside",
                     "write_file",
-                    '{"path":"%s","content":"ok"}' % outside,
+                    '{"path":"%s","content":"ok"}' % target,
                 ),
                 StreamCompleted("tool_calls"),
             ],
@@ -245,9 +408,9 @@ async def test_side_effect_approval_is_exposed_as_agent_event(tmp_path) -> None:
         ]
     )
     runner = make_runner(tmp_path, provider)
-    events = [event async for event in runner.run("外部写入")]
+    events = [event async for event in runner.run("项目内写入")]
     assert any(isinstance(event, ApprovalPending) for event in events)
-    assert outside.read_text(encoding="utf-8") == "ok"
+    assert target.read_text(encoding="utf-8") == "ok"
 
 
 class SlowProvider:

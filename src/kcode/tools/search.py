@@ -4,7 +4,6 @@ import asyncio
 import fnmatch
 import os
 import re
-import time
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -17,7 +16,7 @@ from kcode.tools.base import (
     ToolResult,
     ToolSpec,
 )
-from kcode.tools.policy import resolve_tool_path
+from kcode.tools.paths import resolve_tool_path
 
 
 def _walk(root: Path, context: ToolContext):
@@ -52,7 +51,9 @@ def _matches_glob(relative: str, pattern: str) -> bool:
 def _find(arguments: FindFilesArgs, context: ToolContext) -> ToolResult:
     root = resolve_tool_path(arguments.root, context, existing=True)
     if not root.is_dir():
-        raise ToolExecutionError("not_a_directory", "Search root is not a directory.", path=str(root))
+        raise ToolExecutionError(
+            "not_a_directory", "Search root is not a directory.", path=str(root)
+        )
     results: list[str] = []
     warnings: list[str] = []
     used = 0
@@ -70,13 +71,17 @@ def _find(arguments: FindFilesArgs, context: ToolContext) -> ToolResult:
                 break
             results.append(str(path))
             used += size
-    return ToolResult.success({"root": str(root), "matches": results}, truncated=truncated, warnings=tuple(warnings))
+    return ToolResult.success(
+        {"root": str(root), "matches": results}, truncated=truncated, warnings=tuple(warnings)
+    )
 
 
 def _search(arguments: SearchCodeArgs, context: ToolContext) -> ToolResult:
     root = resolve_tool_path(arguments.root, context, existing=True)
     if not root.is_dir():
-        raise ToolExecutionError("not_a_directory", "Search root is not a directory.", path=str(root))
+        raise ToolExecutionError(
+            "not_a_directory", "Search root is not a directory.", path=str(root)
+        )
     flags = 0 if arguments.case_sensitive else re.IGNORECASE
     try:
         expression = re.compile(arguments.pattern, flags)
@@ -101,7 +106,10 @@ def _search(arguments: SearchCodeArgs, context: ToolContext) -> ToolResult:
                         text = line.rstrip("\r\n")
                         item = {"path": str(path), "line": line_number, "text": text}
                         size = len(str(item).encode("utf-8"))
-                        if len(matches) >= context.limits.max_items or used + size > context.limits.max_bytes:
+                        if (
+                            len(matches) >= context.limits.max_items
+                            or used + size > context.limits.max_bytes
+                        ):
                             truncated = True
                             break
                         matches.append(item)
@@ -110,18 +118,30 @@ def _search(arguments: SearchCodeArgs, context: ToolContext) -> ToolResult:
                     break
         except (UnicodeDecodeError, OSError) as exc:
             warnings.append(f"Skipped {path}: {exc.__class__.__name__}")
-    return ToolResult.success({"root": str(root), "matches": matches}, truncated=truncated, warnings=tuple(warnings))
+    return ToolResult.success(
+        {"root": str(root), "matches": matches}, truncated=truncated, warnings=tuple(warnings)
+    )
 
 
 class FindFilesTool:
-    spec = ToolSpec("find_files", "Find files below a directory using a glob pattern.", FindFilesArgs)
+    spec = ToolSpec(
+        "find_files",
+        "Find files below a directory using a glob pattern. Prefer this purpose-built "
+        "tool over run_command for file discovery.",
+        FindFilesArgs,
+    )
 
     async def execute(self, arguments: ToolArguments, context: ToolContext) -> ToolResult:
         return await asyncio.to_thread(_find, cast(FindFilesArgs, arguments), context)
 
 
 class SearchCodeTool:
-    spec = ToolSpec("search_code", "Search UTF-8 files line by line using a regular expression.", SearchCodeArgs)
+    spec = ToolSpec(
+        "search_code",
+        "Search UTF-8 files line by line using a regular expression. Prefer this "
+        "purpose-built tool over shell search commands.",
+        SearchCodeArgs,
+    )
 
     async def execute(self, arguments: ToolArguments, context: ToolContext) -> ToolResult:
         return await asyncio.to_thread(_search, cast(SearchCodeArgs, arguments), context)

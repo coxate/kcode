@@ -6,6 +6,11 @@ from pathlib import Path
 from kcode.config import default_config_paths, load_config
 from kcode.conversation import Conversation
 from kcode.errors import ConfigError
+from kcode.permissions import (
+    LocalPermissionStore,
+    PermissionConfigLoader,
+    default_permission_paths,
+)
 from kcode.providers.factory import create_provider
 from kcode.tools.base import ToolContext
 from kcode.tools.registry import create_default_registry
@@ -16,6 +21,8 @@ def main() -> int:
     try:
         user_path, project_path = default_config_paths(Path.cwd())
         config = load_config(user_path, project_path)
+        permission_paths = default_permission_paths(Path.cwd())
+        permission_settings = PermissionConfigLoader().load(*permission_paths)
         provider, warnings = create_provider(config.active)
     except ConfigError as exc:
         print(f"KCode configuration error: {exc}", file=sys.stderr)
@@ -25,17 +32,20 @@ def main() -> int:
     context = ToolContext(
         cwd,
         sensitive_values=tuple(
-            provider_config.api_key.get_secret_value() for provider_config in config.providers.values()
+            provider_config.api_key.get_secret_value()
+            for provider_config in config.providers.values()
         ),
     )
     app = KCodeApp(
         provider,
         Conversation(),
-        warnings=warnings,
+        warnings=(*warnings, *permission_settings.warnings),
         cwd=cwd,
         registry=registry,
         context=context,
         agent_config=config.agent,
+        permission_settings=permission_settings,
+        permission_store=LocalPermissionStore(permission_paths[2]),
     )
     app.run()
     return 0
