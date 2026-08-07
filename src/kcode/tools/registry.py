@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from kcode.tools.base import Tool, ToolDefinition
+from kcode.tools.base import Tool, ToolDefinition, ToolEffect
 
 
 class ToolRegistry:
@@ -23,7 +23,9 @@ class ToolRegistry:
             ToolDefinition(
                 tool.spec.name,
                 tool.spec.description,
-                tool.spec.arguments_model.model_json_schema(),
+                tool.spec.parameters
+                if tool.spec.parameters is not None
+                else tool.spec.arguments_model.model_json_schema(),
             )
             for tool in self._tools.values()
             if names is None or tool.spec.name in names
@@ -31,6 +33,9 @@ class ToolRegistry:
 
     def __len__(self) -> int:
         return len(self._tools)
+
+    def names_with_effect(self, effect: ToolEffect) -> set[str]:
+        return {tool.spec.name for tool in self._tools.values() if tool.spec.effect == effect}
 
 
 def create_default_registry() -> ToolRegistry:

@@ -12,6 +12,7 @@ from kcode.permissions.models import (
 
 FRIENDLY_NAMES = {"Bash", "Read", "Write", "Edit", "Glob", "Grep"}
 RULE_PATTERN = re.compile(r"^(Bash|Read|Write|Edit|Glob|Grep)(?:\((.*)\))?$", re.DOTALL)
+MCP_RULE_PATTERN = re.compile(r"^mcp__[A-Za-z0-9_*-]+__[A-Za-z0-9_*-]+$")
 SOURCE_BY_LAYER: dict[str, PermissionSource] = {
     "local": PermissionSource.LOCAL_RULE,
     "project": PermissionSource.PROJECT_RULE,
@@ -25,6 +26,8 @@ def parse_rule(raw: str) -> PermissionRule:
     value = raw.strip()
     match = RULE_PATTERN.fullmatch(value)
     if match is None:
+        if MCP_RULE_PATTERN.fullmatch(value) is not None:
+            return PermissionRule(value, value, None)
         raise ValueError(f"invalid permission rule: {raw!r}")
     pattern = match.group(2)
     if pattern is not None and not pattern:
@@ -55,6 +58,8 @@ def _glob_regex(pattern: str, *, path: bool) -> re.Pattern[str]:
 
 
 def rule_matches(rule: PermissionRule, tool_name: FriendlyToolName, value: str) -> bool:
+    if rule.tool_name.startswith("mcp__"):
+        return _glob_regex(rule.tool_name, path=False).fullmatch(tool_name) is not None
     if rule.tool_name != tool_name:
         return False
     if rule.pattern is None:

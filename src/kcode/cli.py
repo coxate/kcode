@@ -6,6 +6,7 @@ from pathlib import Path
 from kcode.config import default_config_paths, load_config
 from kcode.conversation import Conversation
 from kcode.errors import ConfigError
+from kcode.mcp import McpManager, McpTrustStore
 from kcode.permissions import (
     LocalPermissionStore,
     PermissionConfigLoader,
@@ -29,6 +30,9 @@ def main() -> int:
         return 2
     cwd = Path.cwd().resolve()
     registry = create_default_registry()
+    mcp_manager = (
+        McpManager(config.mcp_servers, cwd, McpTrustStore()) if config.mcp_servers else None
+    )
     context = ToolContext(
         cwd,
         sensitive_values=tuple(
@@ -39,13 +43,14 @@ def main() -> int:
     app = KCodeApp(
         provider,
         Conversation(),
-        warnings=(*warnings, *permission_settings.warnings),
+        warnings=(*warnings, *permission_settings.warnings, *config.mcp_warnings),
         cwd=cwd,
         registry=registry,
         context=context,
         agent_config=config.agent,
         permission_settings=permission_settings,
         permission_store=LocalPermissionStore(permission_paths[2]),
+        mcp_manager=mcp_manager,
     )
     app.run()
     return 0

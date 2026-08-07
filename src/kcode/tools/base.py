@@ -172,6 +172,7 @@ class ToolSpec:
     description: str
     arguments_model: type[ToolArguments]
     effect: ToolEffect | None = ToolEffect.READ_ONLY
+    parameters: Mapping[str, Any] | None = None
 
 
 class Tool(Protocol):

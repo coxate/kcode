@@ -43,7 +43,7 @@ class ToolCategory(StrEnum):
     COMMAND = "command"
 
 
-FriendlyToolName = Literal["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+FriendlyToolName = str
 LayerName = Literal["local", "project", "user"]
 
 

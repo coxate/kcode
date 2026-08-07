@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from kcode.permissions.models import FriendlyToolName, ToolCategory
-from kcode.tools.base import ToolArguments
+from kcode.tools.base import ToolArguments, ToolEffect
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,11 +41,20 @@ SIMPLE_READERS = {
 SHELL_MARKERS = ("|", ";", ">", "<", "&&", "||", "`", "$(", "\n", "\r")
 
 
-def tool_permission_info(tool_name: str, arguments: ToolArguments) -> ToolPermissionInfo:
-    friendly_name, category, field = TOOL_INFO[tool_name]
-    raw_value = str(getattr(arguments, field))
-    value = raw_value.strip() if field == "command" else raw_value
-    return ToolPermissionInfo(friendly_name, category, value)
+def tool_permission_info(
+    tool_name: str,
+    arguments: ToolArguments,
+    declared_effect: ToolEffect | None = None,
+) -> ToolPermissionInfo:
+    if tool_name in TOOL_INFO:
+        friendly_name, category, field = TOOL_INFO[tool_name]
+        raw_value = str(getattr(arguments, field))
+        value = raw_value.strip() if field == "command" else raw_value
+        return ToolPermissionInfo(friendly_name, category, value)
+    category = (
+        ToolCategory.READ if declared_effect == ToolEffect.READ_ONLY else ToolCategory.COMMAND
+    )
+    return ToolPermissionInfo(tool_name, category, "")
 
 
 def is_read_only_command(command: str) -> bool:

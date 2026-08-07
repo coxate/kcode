@@ -4,6 +4,22 @@ agent:
   max_iterations: 10
   max_parallel_tools: 4
 
+# 项目级 MCP Server 首次连接前会请求信任。只有 env/headers 中的
+# ${VAR} 会读取宿主环境；stdio 子进程不会继承其他凭据。
+mcp_servers:
+  local-example:
+    type: stdio
+    command: python
+    args: ["path/to/mcp_server.py"]
+    env:
+      SERVICE_TOKEN: ${LOCAL_MCP_TOKEN}
+
+  remote-example:
+    type: http
+    url: https://example.com/mcp
+    headers:
+      Authorization: "Bearer ${REMOTE_MCP_TOKEN}"
+
 providers:
   - name: openai
     protocol: openai

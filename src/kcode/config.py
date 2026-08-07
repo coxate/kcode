@@ -4,14 +4,68 @@ import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+)
 
 from kcode.errors import ConfigError
 
 ENV_REFERENCE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+ENV_INTERPOLATION = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+class StdioMcpServerConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(min_length=1)
+    source: Literal["user", "project"]
+    type: Literal["stdio"]
+    command: str = Field(min_length=1)
+    args: tuple[str, ...] = ()
+    env: dict[str, str] = Field(default_factory=dict)
+
+
+class HttpMcpServerConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(min_length=1)
+    source: Literal["user", "project"]
+    type: Literal["http"]
+    url: str = Field(min_length=1)
+    headers: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("use an absolute http or https URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("URL must not contain a username or password")
+        return value
+
+
+McpServerConfig = Annotated[
+    StdioMcpServerConfig | HttpMcpServerConfig,
+    Field(discriminator="type"),
+]
+MCP_SERVER_ADAPTER = TypeAdapter(McpServerConfig)
+
+
+class MissingMcpEnvironment(ValueError):
+    def __init__(self, variables: tuple[str, ...]) -> None:
+        super().__init__("missing MCP environment variables: " + ", ".join(variables))
+        self.variables = variables
 
 
 class ProviderConfig(BaseModel):
@@ -39,6 +93,8 @@ class AppConfig(BaseModel):
     active_provider: str
     providers: dict[str, ProviderConfig]
     agent: AgentConfig = AgentConfig()
+    mcp_servers: tuple[McpServerConfig, ...] = ()
+    mcp_warnings: tuple[str, ...] = ()
 
     @property
     def active(self) -> ProviderConfig:
@@ -78,21 +134,70 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     agent = value.get("agent", {})
     if not isinstance(agent, dict):
         raise ConfigError(f"Invalid config {path}, field 'agent': expected a mapping.")
+    mcp_servers = value.get("mcp_servers", {})
+    if not isinstance(mcp_servers, dict):
+        value = dict(value)
+        value["mcp_servers"] = {}
+        value["_mcp_warnings"] = [
+            f"KCode ignored invalid MCP settings at {path}: 'mcp_servers' must be a mapping."
+        ]
     return value
 
 
-def _merge_configs(configs: list[tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
+def _merge_configs(
+    configs: list[tuple[Path, dict[str, Any], Literal["user", "project"]]],
+) -> dict[str, Any]:
     active: str | None = None
     merged: dict[str, dict[str, Any]] = {}
     agent: dict[str, Any] = {}
-    for _, raw in configs:
+    mcp_servers: dict[str, tuple[Literal["user", "project"], Any]] = {}
+    mcp_warnings: list[str] = []
+    for _, raw, source in configs:
         if "active_provider" in raw:
             active = raw["active_provider"]
         agent.update(raw.get("agent", {}))
         for provider in raw.get("providers", []):
             name = provider["name"]
             merged[name] = {**merged.get(name, {}), **provider}
-    return {"active_provider": active, "providers": list(merged.values()), "agent": agent}
+        for name, server in raw.get("mcp_servers", {}).items():
+            mcp_servers[name] = (source, server)
+        mcp_warnings.extend(raw.get("_mcp_warnings", ()))
+    return {
+        "active_provider": active,
+        "providers": list(merged.values()),
+        "agent": agent,
+        "mcp_servers": mcp_servers,
+        "mcp_warnings": mcp_warnings,
+    }
+
+
+def mcp_environment_variables(server: McpServerConfig) -> tuple[str, ...]:
+    values = (
+        server.env.values() if isinstance(server, StdioMcpServerConfig) else server.headers.values()
+    )
+    variables = {match.group(1) for value in values for match in ENV_INTERPOLATION.finditer(value)}
+    return tuple(sorted(variables))
+
+
+def expand_mcp_server(
+    server: McpServerConfig,
+    environ: Mapping[str, str],
+) -> tuple[McpServerConfig, tuple[str, ...]]:
+    variables = mcp_environment_variables(server)
+    missing = tuple(variable for variable in variables if variable not in environ)
+    if missing:
+        raise MissingMcpEnvironment(missing)
+
+    def expand(value: str) -> str:
+        return ENV_INTERPOLATION.sub(lambda match: environ[match.group(1)], value)
+
+    raw = server.model_dump(mode="python")
+    field = "env" if isinstance(server, StdioMcpServerConfig) else "headers"
+    raw[field] = {key: expand(value) for key, value in raw[field].items()}
+    expanded_values = tuple(value for value in raw[field].values() if value)
+    referenced_values = tuple(environ[variable] for variable in variables if environ[variable])
+    sensitive = tuple(dict.fromkeys((*referenced_values, *expanded_values)))
+    return MCP_SERVER_ADAPTER.validate_python(raw), sensitive
 
 
 def _expand_key(value: Any, *, path_label: str, environ: Mapping[str, str]) -> str:
@@ -124,7 +229,10 @@ def load_config(
     if not candidates:
         expected = project_path or user_path or Path(".kcode/config.yaml")
         raise ConfigError(f"No KCode config found. Create {expected} from config.example.yaml.")
-    loaded = [(path, _read_yaml(path)) for path in candidates]
+    loaded: list[tuple[Path, dict[str, Any], Literal["user", "project"]]] = []
+    for path in candidates:
+        source: Literal["user", "project"] = "project" if path == project_path else "user"
+        loaded.append((path, _read_yaml(path), source))
     merged = _merge_configs(loaded)
     source_label = " then ".join(str(path) for path in candidates)
     providers: dict[str, ProviderConfig] = {}
@@ -144,10 +252,29 @@ def load_config(
                 f"Invalid config {source_label}, field 'active_provider': provider '{active}' "
                 "does not exist."
             )
+        mcp_servers: list[McpServerConfig] = []
+        mcp_warnings = list(merged["mcp_warnings"])
+        for name, (source, raw_server) in merged["mcp_servers"].items():
+            try:
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("server name must be a non-empty string")
+                if not isinstance(raw_server, dict):
+                    raise ValueError("server definition must be a mapping")
+                mcp_servers.append(
+                    MCP_SERVER_ADAPTER.validate_python(
+                        {**raw_server, "name": name, "source": source}
+                    )
+                )
+            except (ValidationError, ValueError) as exc:
+                mcp_warnings.append(
+                    f"KCode ignored invalid MCP server {name!r}: {str(exc).splitlines()[0]}."
+                )
         return AppConfig(
             active_provider=active,
             providers=providers,
             agent=AgentConfig.model_validate(merged["agent"]),
+            mcp_servers=tuple(mcp_servers),
+            mcp_warnings=tuple(mcp_warnings),
         )
     except ValidationError as exc:
         first = exc.errors(include_url=False)[0]

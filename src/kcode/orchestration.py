@@ -50,7 +50,7 @@ from kcode.prompting import (
 )
 from kcode.providers.base import ChatProvider
 from kcode.session import AgentSession
-from kcode.tools.base import ApprovalHandler, ToolCall, ToolContext
+from kcode.tools.base import ApprovalHandler, ToolCall, ToolContext, ToolEffect
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry
 from kcode.tools.scheduler import ToolScheduler
@@ -154,6 +154,10 @@ class AgentRunner:
         if self._cancel_event is not None:
             self._cancel_event.set()
 
+    def update_tool_context(self, context: ToolContext) -> None:
+        self.context = context
+        self.context_manager.update_sensitive_values(context.sensitive_values)
+
     async def clear_context(self) -> None:
         await self.context_manager.clear()
 
@@ -164,14 +168,16 @@ class AgentRunner:
         if self._cancel_event is not None:
             raise RuntimeError("Cannot compact context while the agent is running.")
         active_session = session or AgentSession()
-        definitions = self.registry.definitions(
-            PLAN_TOOL_NAMES if active_session.permission_mode == PermissionMode.PLAN else None
-        )
+        definitions = self._definitions_for_mode(active_session.permission_mode)
         return await self.context_manager.compact(
             self.conversation.messages_snapshot(),
             definitions,
             prefix_messages=(self._stable_system,),
         )
+
+    def _definitions_for_mode(self, mode: PermissionMode):
+        plan_tools = PLAN_TOOL_NAMES | self.registry.names_with_effect(ToolEffect.READ_ONLY)
+        return self.registry.definitions(plan_tools if mode == PermissionMode.PLAN else None)
 
     async def _context_or_cancel(
         self,
@@ -271,9 +277,7 @@ class AgentRunner:
                 if cancel_event.is_set():
                     raise _AgentCancelled
                 mode = active_session.permission_mode
-                definitions = self.registry.definitions(
-                    PLAN_TOOL_NAMES if mode == PermissionMode.PLAN else None
-                )
+                definitions = self._definitions_for_mode(mode)
                 yield AgentProgress(
                     mode,
                     iteration,

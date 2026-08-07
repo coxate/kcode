@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from textual import work
@@ -28,6 +29,8 @@ from kcode.events import (
     ToolStarted,
     TurnNotice,
 )
+from kcode.mcp import McpManager
+from kcode.mcp.trust import McpTrustRequest
 from kcode.orchestration import AgentRunner
 from kcode.permissions import (
     ApprovalChoice,
@@ -44,6 +47,7 @@ from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry, create_default_registry
 from kcode.ui.approval import ApprovalScreen
 from kcode.ui.commands import CommandKind, parse_command
+from kcode.ui.mcp_trust import McpTrustScreen
 from kcode.ui.widgets import AssistantResponse, ChatMessageWidget, ToolCallWidget
 
 CAT_BANNER = r""" /\_/\
@@ -94,6 +98,7 @@ class KCodeApp(App[None]):
         session: AgentSession | None = None,
         permission_settings: PermissionSettings | None = None,
         permission_store: LocalPermissionStore | None = None,
+        mcp_manager: McpManager | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -109,6 +114,7 @@ class KCodeApp(App[None]):
         self.permission_store = permission_store or LocalPermissionStore(
             permission_settings.layers[0].path
         )
+        self.mcp_manager = mcp_manager
         self.permission_engine = PermissionEngine(permission_settings)
         self.session = session or AgentSession(
             permission_settings.initial_mode,
@@ -140,16 +146,66 @@ class KCodeApp(App[None]):
         yield VerticalScroll(id="chat")
         with Horizontal(id="prompt-area"):
             yield Static("❯", id="prompt-marker")
-            yield Input(placeholder="Send a message...", id="prompt")
+            yield Input(
+                placeholder="Send a message...",
+                id="prompt",
+                disabled=self.mcp_manager is not None,
+            )
         with Horizontal(id="status"):
             yield Static(self._permission_status_text(), id="permission-status")
             yield Static(self._agent_status_text(), id="agent-status")
             yield Static(f"Model: {self.provider.model_name}", id="model-status")
 
     async def on_mount(self) -> None:
-        self.query_one("#prompt", Input).focus()
         for warning in self.startup_warnings:
             await self._append_notice(warning, "system")
+        if self.mcp_manager is not None:
+            self.query_one("#ready", Label).update("正在检查 MCP Server…")
+            self.initialize_mcp()
+        else:
+            self.query_one("#prompt", Input).focus()
+
+    async def on_unmount(self) -> None:
+        if self.mcp_manager is not None:
+            await asyncio.shield(self.mcp_manager.close())
+
+    async def _request_mcp_trust(self, request: McpTrustRequest) -> bool:
+        return await self.push_screen_wait(McpTrustScreen(request))
+
+    @work(exclusive=True, group="mcp-startup")
+    async def initialize_mcp(self) -> None:
+        assert self.mcp_manager is not None
+        prompt = self.query_one("#prompt", Input)
+        try:
+            await self.mcp_manager.prepare(self._request_mcp_trust)
+            summary = await self.mcp_manager.connect_all()
+            for tool in summary.tools:
+                try:
+                    self.registry.register(tool)
+                except ValueError as exc:
+                    await self._append_notice(f"KCode ignored an MCP tool: {exc}", "system")
+            self.context = replace(
+                self.context,
+                sensitive_values=tuple(
+                    dict.fromkeys((*self.context.sensitive_values, *summary.sensitive_values))
+                ),
+            )
+            self.runner.update_tool_context(self.context)
+            for warning in summary.warnings:
+                await self._append_notice(warning, "system")
+            self.query_one("#ready", Label).update(summary.message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._append_notice(
+                f"KCode could not initialize MCP; built-in tools remain available: "
+                f"{exc.__class__.__name__}.",
+                "error",
+            )
+            self.query_one("#ready", Label).update("Ready. MCP initialization failed.")
+        finally:
+            prompt.disabled = False
+            prompt.focus()
 
     def _agent_status_text(self, phase: str | None = None) -> str:
         iteration = (
@@ -207,8 +263,8 @@ class KCodeApp(App[None]):
     async def _run_command(self, kind: CommandKind, raw: str) -> None:
         if kind == CommandKind.HELP:
             await self._append_notice(
-                "命令：`/plan`、`/do`、`/compact`、`/help`、`/clear`、`/exit`；"
-                "Shift+Tab 切换权限模式。"
+                "命令：`/plan`、`/do`、`/compact`、`/help`、`/clear`、`/exit`、"
+                "`/mcp trust clear`；Shift+Tab 切换权限模式。"
             )
         elif kind == CommandKind.CLEAR:
             self.conversation.clear()
@@ -260,6 +316,26 @@ class KCodeApp(App[None]):
                 self._set_generating(False)
         elif kind == CommandKind.EXIT:
             self.exit()
+        elif kind == CommandKind.MCP_TRUST_CLEAR:
+            if self.mcp_manager is None:
+                await self._append_notice("当前项目没有配置 MCP Server。", "system")
+            else:
+                try:
+                    removed = await asyncio.to_thread(
+                        self.mcp_manager.trust_store.clear_project,
+                        self.cwd,
+                    )
+                    message = (
+                        "已清除当前项目的 MCP 信任；重启 KCode 后将重新确认。"
+                        if removed
+                        else "当前项目没有已保存的 MCP 信任。"
+                    )
+                    await self._append_notice(message, "system")
+                except OSError:
+                    await self._append_notice(
+                        "无法安全清除 MCP 信任，请检查 ~/.kcode 目录权限。",
+                        "error",
+                    )
         else:
             await self._append_notice(f"未知命令：{raw}。输入 `/help` 查看帮助。", "error")
 

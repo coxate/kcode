@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 
 from kcode.permissions.blacklist import dangerous_command_reason
-from kcode.permissions.commands import is_read_only_command, tool_permission_info
+from kcode.permissions.commands import TOOL_INFO, is_read_only_command, tool_permission_info
 from kcode.permissions.models import (
     PermissionDecision,
     PermissionLayer,
@@ -58,9 +58,13 @@ class PermissionEngine:
             self._layers = (layer, *(item for item in self._layers if item.name != "local"))
 
     def effect_for(
-        self, call: ToolCall, arguments: ToolArguments, mode: PermissionMode
+        self,
+        call: ToolCall,
+        arguments: ToolArguments,
+        mode: PermissionMode,
+        declared_effect: ToolEffect | None = None,
     ) -> ToolEffect:
-        info = tool_permission_info(call.name, arguments)
+        info = tool_permission_info(call.name, arguments, declared_effect)
         if info.category == ToolCategory.READ:
             return ToolEffect.READ_ONLY
         if (
@@ -77,10 +81,12 @@ class PermissionEngine:
         arguments: ToolArguments,
         context: ToolContext,
         mode: PermissionMode,
+        declared_effect: ToolEffect | None = None,
     ) -> PermissionDecision:
-        info = tool_permission_info(call.name, arguments)
+        info = tool_permission_info(call.name, arguments, declared_effect)
+        builtin = call.name in TOOL_INFO
 
-        if info.category == ToolCategory.COMMAND:
+        if call.name == "run_command":
             reason = dangerous_command_reason(info.raw_value)
             if reason is not None:
                 return PermissionDecision(
@@ -96,7 +102,9 @@ class PermissionEngine:
                     PermissionSource.PLAN_MODE,
                     "Plan Mode does not allow file changes.",
                 )
-            if info.category == ToolCategory.COMMAND and not is_read_only_command(info.raw_value):
+            if info.category == ToolCategory.COMMAND and (
+                not builtin or not is_read_only_command(info.raw_value)
+            ):
                 return PermissionDecision(
                     PermissionVerdict.DENY,
                     PermissionSource.PLAN_MODE,
@@ -104,7 +112,7 @@ class PermissionEngine:
                 )
 
         match_value = info.raw_value
-        if info.category != ToolCategory.COMMAND:
+        if builtin and info.category != ToolCategory.COMMAND:
             try:
                 sandboxed = resolve_sandboxed_path(info.raw_value, context.workspace_root)
             except SandboxViolation:
@@ -126,9 +134,11 @@ class PermissionEngine:
             )
 
         verdict = MODE_MATRIX[mode][info.category]
-        permanent_rule = (
-            f"{info.friendly_name}({match_value})" if verdict == PermissionVerdict.ASK else None
-        )
+        permanent_rule = None
+        if verdict == PermissionVerdict.ASK:
+            permanent_rule = (
+                info.friendly_name if not builtin else f"{info.friendly_name}({match_value})"
+            )
         return PermissionDecision(
             verdict,
             PermissionSource.MODE,

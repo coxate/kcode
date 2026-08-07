@@ -3,6 +3,9 @@ import json
 import sys
 from pathlib import Path
 
+from mcp import types
+
+from kcode.mcp.tool import McpTool
 from kcode.permissions import (
     ApprovalChoice,
     LocalPermissionStore,
@@ -14,7 +17,7 @@ from kcode.permissions import (
 )
 from kcode.permissions.rules import parse_rule
 from kcode.session import AgentMode
-from kcode.tools.base import ToolCall, ToolContext
+from kcode.tools.base import ToolCall, ToolContext, ToolEffect
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import create_default_registry
 
@@ -23,6 +26,34 @@ def make_executor(root: Path) -> ToolExecutor:
     settings = empty_permission_settings(root)
     return ToolExecutor(
         create_default_registry(),
+        PermissionEngine(settings),
+        LocalPermissionStore(settings.layers[0].path),
+    )
+
+
+class McpHandle:
+    async def call_tool(self, name, arguments):
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"{name}:{arguments}")]
+        )
+
+
+def make_mcp_executor(root: Path, effect: ToolEffect) -> ToolExecutor:
+    settings = empty_permission_settings(root)
+    registry = create_default_registry()
+    registry.register(
+        McpTool(
+            name="mcp__demo__action",
+            remote_name="action",
+            description="Demo action",
+            parameters={"type": "object"},
+            effect=effect,
+            handle=McpHandle(),
+            server_name="demo",
+        )
+    )
+    return ToolExecutor(
+        registry,
         PermissionEngine(settings),
         LocalPermissionStore(settings.layers[0].path),
     )
@@ -47,6 +78,49 @@ async def test_executor_validates_unknown_and_bad_arguments(tmp_path: Path) -> N
     invalid = await executor.execute(ToolCall(0, "2", "read_file", "{"), context, allow)
     assert unknown.error.code == "unknown_tool"
     assert invalid.error.code == "invalid_arguments"
+
+
+async def test_mcp_permissions_follow_declared_effect_and_mode(tmp_path: Path) -> None:
+    approvals = 0
+
+    async def count_approval(_request):
+        nonlocal approvals
+        approvals += 1
+        return ApprovalChoice.ALLOW_ONCE
+
+    call = ToolCall(0, "mcp", "mcp__demo__action", '{"value":"x"}')
+    read_result = await make_mcp_executor(tmp_path, ToolEffect.READ_ONLY).execute(
+        call, ToolContext(tmp_path), count_approval
+    )
+    assert read_result.status == "success"
+    assert approvals == 0
+
+    side_executor = make_mcp_executor(tmp_path, ToolEffect.SIDE_EFFECT)
+    side_result = await side_executor.execute(call, ToolContext(tmp_path), count_approval)
+    assert side_result.status == "success"
+    assert approvals == 1
+
+    bypass = await side_executor.execute(
+        call,
+        ToolContext(tmp_path),
+        count_approval,
+        PermissionMode.BYPASS_PERMISSIONS,
+    )
+    assert bypass.status == "success"
+    assert approvals == 1
+
+    planned = side_executor.prepare(call, ToolContext(tmp_path), PermissionMode.PLAN)
+    assert planned.error.error.code == "plan_mode_denied"
+
+
+async def test_mcp_permanent_allow_uses_exact_tool_name(tmp_path: Path) -> None:
+    executor = make_mcp_executor(tmp_path, ToolEffect.SIDE_EFFECT)
+    call = ToolCall(0, "mcp", "mcp__demo__action", "{}")
+    result = await executor.execute(call, ToolContext(tmp_path), allow_always)
+    assert result.status == "success"
+    rules = (tmp_path / ".kcode" / "permissions.local.yaml").read_text(encoding="utf-8")
+    assert "mcp__demo__action" in rules
+    assert executor.prepare(call, ToolContext(tmp_path)).approval is None
 
 
 async def test_external_write_is_denied_by_sandbox(tmp_path: Path) -> None:

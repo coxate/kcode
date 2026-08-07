@@ -9,7 +9,7 @@ from dataclasses import replace
 
 from pydantic import ValidationError
 
-from kcode.permissions.commands import TOOL_INFO, redact_preview, tool_permission_info
+from kcode.permissions.commands import redact_preview, tool_permission_info
 from kcode.permissions.config import LocalPermissionStore
 from kcode.permissions.engine import PermissionEngine
 from kcode.permissions.models import (
@@ -127,23 +127,9 @@ class ToolExecutor:
                 ),
             )
         try:
-            if call.name not in TOOL_INFO:
-                effect = tool.spec.effect or ToolEffect.SIDE_EFFECT
-                return PreparedToolCall(
-                    call,
-                    tool,
-                    arguments,
-                    effect,
-                    approval=ApprovalRequest(
-                        call.id,
-                        call.name,
-                        redact_preview(call.arguments_json, context.sensitive_values),
-                        "The tool category is unknown and requires user confirmation.",
-                        call.name,
-                    ),
-                )
-            effect = self.permissions.effect_for(call, arguments, mode)
-            decision = self.permissions.evaluate(call, arguments, context, mode)
+            declared_effect = tool.spec.effect or ToolEffect.SIDE_EFFECT
+            effect = self.permissions.effect_for(call, arguments, mode, declared_effect)
+            decision = self.permissions.evaluate(call, arguments, context, mode, declared_effect)
             if decision.verdict == PermissionVerdict.DENY:
                 return PreparedToolCall(
                     call,
@@ -167,11 +153,12 @@ class ToolExecutor:
                 )
             approval = None
             if decision.verdict == PermissionVerdict.ASK:
-                info = tool_permission_info(call.name, arguments)
+                info = tool_permission_info(call.name, arguments, declared_effect)
+                preview = call.arguments_json if call.name.startswith("mcp__") else info.raw_value
                 approval = ApprovalRequest(
                     call.id,
                     info.friendly_name,
-                    redact_preview(info.raw_value, context.sensitive_values),
+                    redact_preview(preview, context.sensitive_values),
                     decision.reason,
                     decision.permanent_rule or info.friendly_name,
                 )
@@ -278,6 +265,8 @@ class ToolExecutor:
             timeout = (
                 prepared.arguments.timeout_seconds
                 if isinstance(prepared.arguments, RunCommandArgs)
+                else context.limits.command_timeout_seconds
+                if prepared.call.name.startswith("mcp__")
                 else context.limits.file_timeout_seconds
             )
             execution_task = asyncio.create_task(

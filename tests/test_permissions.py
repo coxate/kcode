@@ -109,6 +109,17 @@ def test_rule_parser_and_globs() -> None:
         parse_rule("Bash()")
 
 
+def test_mcp_permission_name_rules() -> None:
+    exact = parse_rule("mcp__github__create_issue")
+    wildcard = parse_rule("mcp__github__*")
+    assert rule_matches(exact, "mcp__github__create_issue", "")
+    assert not rule_matches(exact, "mcp__github__list_issues", "")
+    assert rule_matches(wildcard, "mcp__github__list_issues", "")
+    assert not rule_matches(wildcard, "mcp__slack__list_messages", "")
+    with pytest.raises(ValueError):
+        parse_rule("external-tool")
+
+
 def test_layer_priority_and_deny_before_allow(tmp_path: Path) -> None:
     local = PermissionLayer(
         "local",
