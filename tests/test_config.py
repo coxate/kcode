@@ -65,6 +65,40 @@ providers:
     assert config.active.name == "second"
 
 
+def test_provider_context_window_is_optional_and_positive(tmp_path: Path) -> None:
+    configured = write_config(
+        tmp_path / "configured.yaml",
+        """
+active_provider: main
+providers:
+  - name: main
+    protocol: openai
+    model: m
+    base_url: https://x.test
+    api_key: k
+    context_window: 100000
+""",
+    )
+    config = load_config(None, configured, {})
+    assert config.active.context_window == 100000
+
+    invalid = write_config(
+        tmp_path / "invalid.yaml",
+        """
+active_provider: main
+providers:
+  - name: main
+    protocol: openai
+    model: m
+    base_url: https://x.test
+    api_key: k
+    context_window: 0
+""",
+    )
+    with pytest.raises(ConfigError, match="context_window"):
+        load_config(None, invalid, {})
+
+
 def test_agent_config_defaults_and_field_merge(tmp_path: Path) -> None:
     user = write_config(
         tmp_path / "user.yaml",

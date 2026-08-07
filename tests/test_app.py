@@ -172,6 +172,55 @@ async def test_commands_are_local_and_clear_history() -> None:
         assert app.session.latest_plan is None
 
 
+async def test_compact_command_only_sends_a_tool_free_summary_request() -> None:
+    class CompactProvider:
+        display_name = "fake-provider"
+        model_name = "fake-model"
+
+        def __init__(self):
+            self.requests = []
+
+        async def stream(self, messages, tools=(), tool_choice="auto"):
+            self.requests.append((tuple(messages), tuple(tools), tool_choice))
+            yield TextDelta(
+                json.dumps(
+                    {
+                        "goal": "continue",
+                        "confirmed_facts": [],
+                        "inferences": [],
+                        "unknowns": [],
+                        "decisions": [],
+                        "files": [],
+                        "errors": [],
+                        "current_state": "compacted",
+                        "pending_tasks": [],
+                        "next_steps": [],
+                        "artifact_references": [],
+                        "history_incomplete": False,
+                    }
+                )
+            )
+            yield StreamCompleted("stop")
+
+    provider = CompactProvider()
+    conversation = Conversation()
+    for index in range(6):
+        conversation.commit(f"message-{index}-" + "x" * 9_000, "ack")
+    original = conversation.messages_snapshot()
+    app = KCodeApp(provider, conversation)
+
+    async with app.run_test() as pilot:
+        await submit(app, pilot, "/compact")
+        await pilot.pause(0.1)
+        notices = [widget.text for widget in app.query(ChatMessageWidget)]
+        assert any("上下文压缩完成" in notice for notice in notices)
+        assert app.query_one("#prompt", Input).disabled is False
+
+    assert provider.requests[0][1:] == ((), "none")
+    assert len(provider.requests) == 1
+    assert conversation.messages_snapshot() == original
+
+
 async def test_plan_and_do_commands_update_visible_mode() -> None:
     app = KCodeApp(FakeProvider())
     async with app.run_test(size=(100, 30)) as pilot:

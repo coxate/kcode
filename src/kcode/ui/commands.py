@@ -8,6 +8,7 @@ class CommandKind(StrEnum):
     EXIT = "exit"
     PLAN = "plan"
     DO = "do"
+    COMPACT = "compact"
     UNKNOWN = "unknown"
 
 
@@ -28,5 +29,6 @@ def parse_command(text: str) -> Command | None:
         "exit": CommandKind.EXIT,
         "plan": CommandKind.PLAN,
         "do": CommandKind.DO,
+        "compact": CommandKind.COMPACT,
     }
     return Command(known.get(value, CommandKind.UNKNOWN), stripped)

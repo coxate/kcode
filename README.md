@@ -54,9 +54,11 @@ providers:
     base_url: https://api.deepseek.com
     api_key: ${DEEPSEEK_API_KEY}
     thinking: false
+    context_window: 64000
 ```
 
 DeepSeek 使用 OpenAI 兼容协议，因此 `protocol` 保持为 `openai`。Claude 的 `thinking: true` 会开启独立 thinking 区域；该设置对 OpenAI/DeepSeek 会被忽略并显示提示。
+`context_window` 是可选的模型上下文窗口覆盖值；未配置时 KCode 会优先使用已知模型元数据，再使用保守默认值并降低预算估算置信度。
 
 权限规则使用独立文件，优先级为本地 > 项目 > 用户：
 

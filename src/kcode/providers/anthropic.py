@@ -19,7 +19,7 @@ from kcode.conversation import (
     ToolResultMessage,
     UserMessage,
 )
-from kcode.errors import ProviderError, ProviderErrorKind
+from kcode.errors import ProviderError, ProviderErrorKind, is_prompt_too_long_error
 from kcode.events import (
     ProviderEvent,
     StreamCompleted,
@@ -213,6 +213,15 @@ class AnthropicProvider:
             ) from exc
         except (anthropic.APIConnectionError, anthropic.APITimeoutError) as exc:
             raise ProviderError(ProviderErrorKind.NETWORK, "Cannot connect to Anthropic.") from exc
+        except anthropic.BadRequestError as exc:
+            if is_prompt_too_long_error(exc):
+                raise ProviderError(
+                    ProviderErrorKind.PROMPT_TOO_LONG,
+                    "The request exceeds the model context window.",
+                ) from exc
+            raise ProviderError(
+                ProviderErrorKind.INVALID_RESPONSE, "Anthropic rejected the request."
+            ) from exc
         except anthropic.APIError as exc:
             raise ProviderError(
                 ProviderErrorKind.INVALID_RESPONSE, "Anthropic returned an invalid response."

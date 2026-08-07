@@ -207,10 +207,12 @@ class KCodeApp(App[None]):
     async def _run_command(self, kind: CommandKind, raw: str) -> None:
         if kind == CommandKind.HELP:
             await self._append_notice(
-                "命令：`/plan`、`/do`、`/help`、`/clear`、`/exit`；Shift+Tab 切换权限模式。"
+                "命令：`/plan`、`/do`、`/compact`、`/help`、`/clear`、`/exit`；"
+                "Shift+Tab 切换权限模式。"
             )
         elif kind == CommandKind.CLEAR:
             self.conversation.clear()
+            await self.runner.clear_context()
             self.session.clear()
             self._iteration = 0
             self._usage = TokenUsage()
@@ -230,6 +232,32 @@ class KCodeApp(App[None]):
             self._set_agent_status()
             suffix = "，下一条请求将使用最新计划一次。" if has_plan else "。"
             await self._append_notice("已进入 Do Mode" + suffix)
+        elif kind == CommandKind.COMPACT:
+            self._set_generating(True)
+            self._set_agent_status("压缩上下文")
+            try:
+                snapshot = await self.runner.compact_context(self.session)
+                result = snapshot.compaction_result
+                if result is None or not result.success:
+                    detail = result.failure_reason if result is not None else "没有可压缩历史"
+                    await self._append_notice(f"上下文压缩失败：{detail}", "error")
+                else:
+                    await self._append_notice(
+                        "上下文压缩完成："
+                        f"约 {result.before_tokens} → {result.after_tokens or '?'} Token；"
+                        f"置信度 {snapshot.budget.confidence}；"
+                        f"history_incomplete={str(result.history_incomplete).lower()}；"
+                        f"Artifact {snapshot.offloaded_count} 个。",
+                        "system",
+                    )
+            except Exception as exc:
+                await self._append_notice(
+                    f"上下文压缩失败：{exc.__class__.__name__}。",
+                    "error",
+                )
+            finally:
+                self._set_agent_status()
+                self._set_generating(False)
         elif kind == CommandKind.EXIT:
             self.exit()
         else:

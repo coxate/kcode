@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 
 from kcode import __version__
 from kcode.config import AgentConfig
+from kcode.context import ContextManager, ContextSnapshot
 from kcode.conversation import (
     AssistantMessage,
     Conversation,
@@ -17,7 +18,7 @@ from kcode.conversation import (
     ToolResultMessage,
     UserMessage,
 )
-from kcode.errors import ProviderError
+from kcode.errors import ProviderError, ProviderErrorKind
 from kcode.events import (
     AgentEvent,
     AgentPhase,
@@ -126,6 +127,7 @@ class AgentRunner:
         scheduler: ToolScheduler | None = None,
         prompt_builder: SystemPromptBuilder | None = None,
         environment_collector: EnvironmentCollector | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self.provider = provider
         self.conversation = conversation
@@ -138,11 +140,59 @@ class AgentRunner:
         self.prompt_builder = prompt_builder or SystemPromptBuilder(DEFAULT_PROMPT_SECTIONS)
         self.environment_collector = environment_collector or EnvironmentCollector()
         self._stable_system = StableSystemMessage(self.prompt_builder.build())
+        provider_config = getattr(provider, "config", None)
+        configured_window = getattr(provider_config, "context_window", None)
+        self.context_manager = context_manager or ContextManager(
+            context.workspace_root,
+            provider=provider,
+            context_window=configured_window,
+            sensitive_values=context.sensitive_values,
+        )
         self._cancel_event: asyncio.Event | None = None
 
     def cancel(self) -> None:
         if self._cancel_event is not None:
             self._cancel_event.set()
+
+    async def clear_context(self) -> None:
+        await self.context_manager.clear()
+
+    async def compact_context(
+        self,
+        session: AgentSession | None = None,
+    ) -> ContextSnapshot:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot compact context while the agent is running.")
+        active_session = session or AgentSession()
+        definitions = self.registry.definitions(
+            PLAN_TOOL_NAMES if active_session.permission_mode == PermissionMode.PLAN else None
+        )
+        return await self.context_manager.compact(
+            self.conversation.messages_snapshot(),
+            definitions,
+            prefix_messages=(self._stable_system,),
+        )
+
+    async def _context_or_cancel(
+        self,
+        operation: Awaitable[ContextSnapshot],
+        cancel_event: asyncio.Event,
+    ) -> ContextSnapshot:
+        operation_task = asyncio.ensure_future(operation)
+        cancel_task = asyncio.create_task(cancel_event.wait())
+        done, _ = await asyncio.wait(
+            (operation_task, cancel_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancel_task in done and cancel_event.is_set():
+            operation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await operation_task
+            raise _AgentCancelled
+        cancel_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cancel_task
+        return await operation_task
 
     async def _next_or_cancel(
         self,
@@ -241,16 +291,60 @@ class AgentRunner:
                     environment,
                     reminders,
                 )
-                request_messages = (
-                    *prompt_package.messages(),
-                    *history,
-                    *current,
+                canonical_messages = (*history, *current)
+                snapshot = await self._context_or_cancel(
+                    self.context_manager.build_snapshot(
+                        canonical_messages,
+                        definitions,
+                        prefix_messages=prompt_package.messages(),
+                    ),
+                    cancel_event,
                 )
-                async for item in self._collect(request_messages, definitions, cancel_event):
-                    if isinstance(item, ModelResponse):
-                        response = item
-                    elif isinstance(item, (TextDelta, ThinkingDelta)):
-                        yield item
+                request_messages = snapshot.messages
+                if snapshot.compaction_result is not None:
+                    result = snapshot.compaction_result
+                    if result.success:
+                        yield TurnNotice(
+                            "上下文已自动压缩："
+                            f"约 {result.before_tokens} → {result.after_tokens or '?'} Token，"
+                            f"history_incomplete={str(result.history_incomplete).lower()}。"
+                        )
+                    else:
+                        yield TurnNotice(f"自动上下文压缩失败：{result.failure_reason}")
+                emergency_attempted = False
+                while True:
+                    try:
+                        async for item in self._collect(
+                            request_messages,
+                            definitions,
+                            cancel_event,
+                        ):
+                            if isinstance(item, ModelResponse):
+                                response = item
+                            elif isinstance(item, (TextDelta, ThinkingDelta)):
+                                yield item
+                        break
+                    except ProviderError as exc:
+                        if exc.kind != ProviderErrorKind.PROMPT_TOO_LONG or emergency_attempted:
+                            raise
+                        emergency_attempted = True
+                        emergency = await self._context_or_cancel(
+                            self.context_manager.emergency_snapshot(
+                                canonical_messages,
+                                definitions,
+                                prefix_messages=prompt_package.messages(),
+                            ),
+                            cancel_event,
+                        )
+                        if not emergency.budget.fits_after_emergency:
+                            raise ProviderError(
+                                ProviderErrorKind.PROMPT_TOO_LONG,
+                                "Emergency compaction could not fit the request in the "
+                                "context window.",
+                            ) from exc
+                        request_messages = emergency.messages
+                        response = None
+                        yield TurnNotice("上下文超过模型窗口，已紧急压缩并重试一次。")
                 assert response is not None
 
                 request_usage = response.usage or TokenUsage()
@@ -260,6 +354,11 @@ class AgentRunner:
                     else cumulative_usage.plus(request_usage)
                 )
                 yield TokenUsageUpdated(iteration, request_usage, cumulative_usage)
+                self.context_manager.record_usage(
+                    request_usage,
+                    request_messages,
+                    definitions,
+                )
 
                 if not response.tool_calls:
                     if not response.text.strip():
@@ -335,12 +434,22 @@ class AgentRunner:
                         cancel_event,
                     )
                     for item, result in zip(batch.calls, results, strict=True):
+                        if (
+                            item.call.name == "read_file"
+                            and result.status == "success"
+                            and result.data is not None
+                        ):
+                            path = result.data.get("path")
+                            content = result.data.get("content")
+                            if isinstance(path, str) and isinstance(content, str):
+                                await self.context_manager.record_file_snapshot(path, content)
                         result_messages.append(
                             ToolResultMessage(item.call.id, item.call.name, result)
                         )
                         yield ToolFinished(item.call, result)
 
                 checkpoint = tuple(result_messages)
+                await self.context_manager.record_tool_results((assistant, *checkpoint))
                 self.conversation.checkpoint_tool_step(handle, assistant, checkpoint)
                 current.extend((assistant, *checkpoint))
 

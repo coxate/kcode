@@ -22,7 +22,7 @@ from kcode.conversation import (
     ToolResultMessage,
     UserMessage,
 )
-from kcode.errors import ProviderError, ProviderErrorKind
+from kcode.errors import ProviderError, ProviderErrorKind, is_prompt_too_long_error
 from kcode.events import (
     ProviderEvent,
     StreamCompleted,
@@ -289,6 +289,15 @@ class OpenAIProvider:
         except (openai.APIConnectionError, openai.APITimeoutError) as exc:
             raise ProviderError(
                 ProviderErrorKind.NETWORK, "Cannot connect to the OpenAI-compatible endpoint."
+            ) from exc
+        except openai.BadRequestError as exc:
+            if is_prompt_too_long_error(exc):
+                raise ProviderError(
+                    ProviderErrorKind.PROMPT_TOO_LONG,
+                    "The request exceeds the model context window.",
+                ) from exc
+            raise ProviderError(
+                ProviderErrorKind.INVALID_RESPONSE, "The endpoint rejected the request."
             ) from exc
         except openai.APIError as exc:
             raise ProviderError(

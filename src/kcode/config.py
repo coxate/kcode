@@ -23,6 +23,7 @@ class ProviderConfig(BaseModel):
     base_url: str = Field(min_length=1)
     api_key: SecretStr
     thinking: bool = False
+    context_window: int | None = Field(default=None, ge=1)
 
 
 class AgentConfig(BaseModel):
