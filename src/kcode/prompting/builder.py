@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from kcode.conversation import (
     ConversationMessage,
@@ -39,6 +39,15 @@ class SystemPromptBuilder:
         return "\n\n".join(
             section.content.strip() for section in sections if section.content.strip()
         )
+
+    def with_content(self, name: str, content: str) -> SystemPromptBuilder:
+        if not any(section.name == name for section in self._sections):
+            raise KeyError(f"Unknown prompt section: {name}.")
+        sections = tuple(
+            replace(section, content=content) if section.name == name else section
+            for section in self._sections
+        )
+        return SystemPromptBuilder(sections)
 
 
 @dataclass(frozen=True, slots=True)

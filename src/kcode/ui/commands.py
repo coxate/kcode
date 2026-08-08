@@ -9,6 +9,7 @@ class CommandKind(StrEnum):
     PLAN = "plan"
     DO = "do"
     COMPACT = "compact"
+    RESUME = "resume"
     MCP_TRUST_CLEAR = "mcp_trust_clear"
     UNKNOWN = "unknown"
 
@@ -31,6 +32,7 @@ def parse_command(text: str) -> Command | None:
         "plan": CommandKind.PLAN,
         "do": CommandKind.DO,
         "compact": CommandKind.COMPACT,
+        "resume": CommandKind.RESUME,
         "mcp trust clear": CommandKind.MCP_TRUST_CLEAR,
     }
     return Command(known.get(value, CommandKind.UNKNOWN), stripped)

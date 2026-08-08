@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -14,7 +15,7 @@ from textual.worker import Worker, WorkerCancelled
 
 from kcode import __version__
 from kcode.config import AgentConfig
-from kcode.conversation import Conversation
+from kcode.conversation import AssistantMessage, Conversation, ToolResultMessage, UserMessage
 from kcode.events import (
     AgentPhase,
     AgentProgress,
@@ -29,6 +30,7 @@ from kcode.events import (
     ToolStarted,
     TurnNotice,
 )
+from kcode.history.runtime import ResumeResult, SessionCoordinator
 from kcode.mcp import McpManager
 from kcode.mcp.trust import McpTrustRequest
 from kcode.orchestration import AgentRunner
@@ -40,6 +42,7 @@ from kcode.permissions import (
     PermissionSettings,
     empty_permission_settings,
 )
+from kcode.prompting import SystemPromptBuilder
 from kcode.providers.base import ChatProvider
 from kcode.session import AgentSession
 from kcode.tools.base import ApprovalRequest, ToolContext
@@ -48,6 +51,7 @@ from kcode.tools.registry import ToolRegistry, create_default_registry
 from kcode.ui.approval import ApprovalScreen
 from kcode.ui.commands import CommandKind, parse_command
 from kcode.ui.mcp_trust import McpTrustScreen
+from kcode.ui.resume import ResumeScreen
 from kcode.ui.widgets import AssistantResponse, ChatMessageWidget, ToolCallWidget
 
 CAT_BANNER = r""" /\_/\
@@ -99,10 +103,17 @@ class KCodeApp(App[None]):
         permission_settings: PermissionSettings | None = None,
         permission_store: LocalPermissionStore | None = None,
         mcp_manager: McpManager | None = None,
+        prompt_builder: SystemPromptBuilder | None = None,
+        coordinator: SessionCoordinator | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
-        self.conversation = conversation or Conversation()
+        self.coordinator = coordinator
+        self.conversation = (
+            coordinator.current.conversation
+            if coordinator is not None
+            else (conversation or Conversation())
+        )
         self.startup_warnings = warnings
         self.cwd = (cwd or Path.cwd()).resolve()
         self.registry = registry or create_default_registry()
@@ -128,13 +139,20 @@ class KCodeApp(App[None]):
             self.context,
             self._request_approval,
             self.agent_config,
+            prompt_builder=prompt_builder,
+            context_manager=(
+                coordinator.current.context_manager if coordinator is not None else None
+            ),
         )
+        if coordinator is not None:
+            self.runner.bind_session(coordinator.current)
         self.generating = False
         self._generation_worker: Worker[None] | None = None
         self._active_response: AssistantResponse | None = None
         self._tool_widgets: dict[str, ToolCallWidget] = {}
         self._iteration = 0
         self._usage = TokenUsage()
+        self._coordinator_closed = False
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -166,6 +184,11 @@ class KCodeApp(App[None]):
             self.query_one("#prompt", Input).focus()
 
     async def on_unmount(self) -> None:
+        if self.coordinator is not None and not self._coordinator_closed:
+            warnings = await asyncio.shield(self.coordinator.close())
+            for warning in warnings:
+                print(f"KCode warning: {warning}", file=sys.stderr)
+            self._coordinator_closed = True
         if self.mcp_manager is not None:
             await asyncio.shield(self.mcp_manager.close())
 
@@ -191,6 +214,8 @@ class KCodeApp(App[None]):
                 ),
             )
             self.runner.update_tool_context(self.context)
+            if self.coordinator is not None:
+                self.coordinator.update_sensitive_values(self.context.sensitive_values)
             for warning in summary.warnings:
                 await self._append_notice(warning, "system")
             self.query_one("#ready", Label).update(summary.message)
@@ -264,17 +289,27 @@ class KCodeApp(App[None]):
         if kind == CommandKind.HELP:
             await self._append_notice(
                 "命令：`/plan`、`/do`、`/compact`、`/help`、`/clear`、`/exit`、"
-                "`/mcp trust clear`；Shift+Tab 切换权限模式。"
+                "`/resume`、`/mcp trust clear`；Shift+Tab 切换权限模式。"
             )
         elif kind == CommandKind.CLEAR:
-            self.conversation.clear()
-            await self.runner.clear_context()
+            clear_warnings: tuple[str, ...] = ()
+            if self.coordinator is None:
+                self.conversation.clear()
+                await self.runner.clear_context()
+            else:
+                runtime, clear_warnings = await self.coordinator.clear()
+                self.runner.bind_session(runtime)
+                self.conversation = runtime.conversation
             self.session.clear()
             self._iteration = 0
             self._usage = TokenUsage()
             await self.query_one("#chat", VerticalScroll).remove_children()
+            for warning in clear_warnings:
+                await self._append_notice(warning, "error")
             self._set_permission_status()
             self._set_agent_status()
+        elif kind == CommandKind.RESUME:
+            self._resume_session()
         elif kind == CommandKind.PLAN:
             self.session.set_mode(PermissionMode.PLAN)
             self._iteration = 0
@@ -315,6 +350,10 @@ class KCodeApp(App[None]):
                 self._set_agent_status()
                 self._set_generating(False)
         elif kind == CommandKind.EXIT:
+            if self.coordinator is not None and not self._coordinator_closed:
+                for warning in await self.coordinator.close():
+                    await self._append_notice(warning, "error")
+                self._coordinator_closed = True
             self.exit()
         elif kind == CommandKind.MCP_TRUST_CLEAR:
             if self.mcp_manager is None:
@@ -348,6 +387,58 @@ class KCodeApp(App[None]):
         prompt.disabled = value
         if not value:
             prompt.focus()
+
+    @work(exclusive=True, group="resume")
+    async def _resume_session(self) -> None:
+        if self.coordinator is None:
+            await self._append_notice("当前 App 没有启用会话持久化。", "error")
+            return
+        self._set_generating(True)
+        self._set_agent_status("扫描会话")
+        try:
+            summaries = await asyncio.to_thread(self.coordinator.list_sessions)
+            selected = await self.push_screen_wait(ResumeScreen(summaries))
+            if selected is None:
+                return
+            self._set_agent_status("恢复会话")
+            result = await self.coordinator.resume(
+                selected,
+                tools=self.runner.tool_definitions(self.session.permission_mode),
+            )
+            self.runner.bind_session(result.runtime)
+            self.conversation = result.runtime.conversation
+            await self._redraw_resumed_session(result)
+        except Exception as exc:
+            await self._append_notice(f"恢复会话失败：{exc}", "error")
+        finally:
+            self._set_agent_status()
+            self._set_generating(False)
+
+    async def _redraw_resumed_session(self, result: ResumeResult) -> None:
+        chat = self.query_one("#chat", VerticalScroll)
+        await chat.remove_children()
+        self._tool_widgets.clear()
+        for message in result.runtime.conversation.messages_snapshot():
+            if isinstance(message, UserMessage):
+                await chat.mount(ChatMessageWidget("user", message.content))
+            elif isinstance(message, AssistantMessage):
+                if message.tool_calls:
+                    names = ", ".join(call.name for call in message.tool_calls)
+                    await chat.mount(ChatMessageWidget("system", f"历史工具调用：{names}"))
+                elif message.content.strip():
+                    await chat.mount(ChatMessageWidget("assistant", message.content))
+            elif isinstance(message, ToolResultMessage):
+                await chat.mount(
+                    ChatMessageWidget(
+                        "system",
+                        f"历史工具结果：{message.tool_name} · {message.result.status}",
+                    )
+                )
+        for warning in result.warnings:
+            await self._append_notice(warning, "system")
+        self._iteration = 0
+        self._usage = TokenUsage()
+        self._set_agent_status()
 
     @work(exclusive=True, group="generation")
     async def generate_response(self, user_text: str, response: AssistantResponse) -> None:

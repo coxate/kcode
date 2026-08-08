@@ -39,6 +39,8 @@ from kcode.events import (
     TurnNotice,
     UsageReported,
 )
+from kcode.history.models import PersistenceState
+from kcode.history.runtime import SessionRuntime
 from kcode.permissions.models import PermissionMode
 from kcode.prompting import (
     DEFAULT_PROMPT_SECTIONS,
@@ -149,14 +151,24 @@ class AgentRunner:
             sensitive_values=context.sensitive_values,
         )
         self._cancel_event: asyncio.Event | None = None
+        self._session_runtime: SessionRuntime | None = None
 
     def cancel(self) -> None:
         if self._cancel_event is not None:
             self._cancel_event.set()
 
+    def bind_session(self, runtime: SessionRuntime) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot switch sessions while the agent is running.")
+        self._session_runtime = runtime
+        self.conversation = runtime.conversation
+        self.context_manager = runtime.context_manager
+
     def update_tool_context(self, context: ToolContext) -> None:
         self.context = context
         self.context_manager.update_sensitive_values(context.sensitive_values)
+        if self._session_runtime is not None:
+            self._session_runtime.journal.update_sensitive_values(context.sensitive_values)
 
     async def clear_context(self) -> None:
         await self.context_manager.clear()
@@ -178,6 +190,9 @@ class AgentRunner:
     def _definitions_for_mode(self, mode: PermissionMode):
         plan_tools = PLAN_TOOL_NAMES | self.registry.names_with_effect(ToolEffect.READ_ONLY)
         return self.registry.definitions(plan_tools if mode == PermissionMode.PLAN else None)
+
+    def tool_definitions(self, mode: PermissionMode):
+        return self._definitions_for_mode(mode)
 
     async def _context_or_cancel(
         self,
@@ -260,6 +275,9 @@ class AgentRunner:
         cancel_event = asyncio.Event()
         self._cancel_event = cancel_event
         history = self.conversation.messages_snapshot()
+        persisted_index = len(history)
+        active_runtime = self._session_runtime
+        resume_reminder = active_runtime.resume_reminder if active_runtime is not None else None
         handle = self.conversation.begin_turn(user_text)
         current: list[ConversationMessage] = [UserMessage(user_text)]
         cumulative_usage: TokenUsage | None = None
@@ -273,6 +291,11 @@ class AgentRunner:
         iteration = 0
 
         try:
+            if (
+                active_runtime is not None
+                and active_runtime.journal.state == PersistenceState.DEGRADED
+            ):
+                yield TurnNotice(self._persistence_warning(active_runtime))
             for iteration in range(1, self.config.max_iterations + 1):
                 if cancel_event.is_set():
                     raise _AgentCancelled
@@ -285,11 +308,14 @@ class AgentRunner:
                     AgentPhase.MODEL,
                 )
                 response: ModelResponse | None = None
-                reminders = (
-                    (build_plan_mode_reminder(iteration),)
-                    if mode == PermissionMode.PLAN
-                    else ((approved_plan_reminder,) if approved_plan_reminder is not None else ())
-                )
+                reminder_items = []
+                if mode == PermissionMode.PLAN:
+                    reminder_items.append(build_plan_mode_reminder(iteration))
+                elif approved_plan_reminder is not None:
+                    reminder_items.append(approved_plan_reminder)
+                if resume_reminder is not None:
+                    reminder_items.append(resume_reminder)
+                reminders = tuple(reminder_items)
                 prompt_package = PromptPackage(
                     self._stable_system,
                     environment,
@@ -377,6 +403,12 @@ class AgentRunner:
                     final = AssistantMessage(response.text)
                     self.conversation.complete_turn(handle, final)
                     turn_open = False
+                    persisted_index, saved = await self._persist_since(
+                        active_runtime,
+                        persisted_index,
+                    )
+                    if not saved and active_runtime is not None:
+                        yield TurnNotice(self._persistence_warning(active_runtime))
                     if mode == PermissionMode.PLAN:
                         active_session.record_plan(response.text)
                     yield AgentProgress(
@@ -407,7 +439,7 @@ class AgentRunner:
                 for call in response.tool_calls:
                     yield ToolCallReady(call)
 
-                result_messages: list[ToolResultMessage] = []
+                assistant_checkpointed = False
                 for batch_index, batch in enumerate(self.scheduler.batches(prepared), 1):
                     approvals = tuple(
                         item.approval for item in batch.calls if item.approval is not None
@@ -437,6 +469,7 @@ class AgentRunner:
                         self.approve,
                         cancel_event,
                     )
+                    batch_messages: list[ToolResultMessage] = []
                     for item, result in zip(batch.calls, results, strict=True):
                         if (
                             item.call.name == "read_file"
@@ -447,15 +480,26 @@ class AgentRunner:
                             content = result.data.get("content")
                             if isinstance(path, str) and isinstance(content, str):
                                 await self.context_manager.record_file_snapshot(path, content)
-                        result_messages.append(
+                        batch_messages.append(
                             ToolResultMessage(item.call.id, item.call.name, result)
                         )
                         yield ToolFinished(item.call, result)
-
-                checkpoint = tuple(result_messages)
-                await self.context_manager.record_tool_results((assistant, *checkpoint))
-                self.conversation.checkpoint_tool_step(handle, assistant, checkpoint)
-                current.extend((assistant, *checkpoint))
+                    checkpoint = tuple(batch_messages)
+                    context_checkpoint = (
+                        checkpoint
+                        if assistant_checkpointed
+                        else (assistant, *checkpoint)
+                    )
+                    await self.context_manager.record_tool_results(context_checkpoint)
+                    self.conversation.checkpoint_tool_step(handle, assistant, checkpoint)
+                    current.extend(context_checkpoint)
+                    assistant_checkpointed = True
+                    persisted_index, saved = await self._persist_since(
+                        active_runtime,
+                        persisted_index,
+                    )
+                    if not saved and active_runtime is not None:
+                        yield TurnNotice(self._persistence_warning(active_runtime))
 
                 if cancel_event.is_set():
                     raise _AgentCancelled
@@ -497,7 +541,26 @@ class AgentRunner:
         finally:
             if turn_open:
                 self.conversation.stop_turn(handle)
+            if active_runtime is not None and resume_reminder is not None:
+                active_runtime.consume_resume_reminder()
             self._cancel_event = None
+
+    async def _persist_since(
+        self,
+        runtime: SessionRuntime | None,
+        start: int,
+    ) -> tuple[int, bool]:
+        snapshot = self.conversation.messages_snapshot()
+        end = len(snapshot)
+        if runtime is None or end <= start:
+            return end, True
+        saved = await runtime.journal.append_checkpoint(snapshot[start:end])
+        return end, saved
+
+    @staticmethod
+    def _persistence_warning(runtime: SessionRuntime) -> str:
+        detail = runtime.journal.failure_reason or "unknown disk error"
+        return f"Session persistence is incomplete; memory-only conversation continues: {detail}"
 
 
 # 兼容 0.2.0 中引用的内部名称；新代码统一使用 AgentRunner。

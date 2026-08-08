@@ -37,3 +37,12 @@ or the user's current instruction.
 </approved_plan>"""
         % value,
     )
+
+
+def build_session_resume_reminder(last_active_at: float) -> SystemReminderMessage:
+    return SystemReminderMessage(
+        "session_resume",
+        "This conversation was restored from a local KCode journal whose last activity was "
+        f"at Unix time {last_active_at:.0f}. Files, processes, permissions, and external state "
+        "may have changed. Re-check relevant current state before relying on historical results.",
+    )

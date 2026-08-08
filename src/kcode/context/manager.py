@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import secrets
-import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +27,7 @@ from kcode.context.models import (
 from kcode.context.usage import UsageEstimator, normalize_usage, resolve_context_window
 from kcode.conversation import ConversationMessage, SystemMessage
 from kcode.events import TokenUsage
+from kcode.history.ids import create_session_id
 from kcode.providers.base import ChatProvider
 from kcode.tools.base import ToolDefinition
 
@@ -40,10 +39,6 @@ RECENT_MESSAGES = 5
 AUTOMATIC_FAILURE_LIMIT = 3
 FILE_SNAPSHOT_LIMIT = 5
 FILE_SNAPSHOT_CHARACTERS = 17_500
-
-
-def create_session_id() -> str:
-    return f"{int(time.time())}-{secrets.token_hex(4)}"
 
 
 def _fingerprint(messages: Sequence[ConversationMessage]) -> str:

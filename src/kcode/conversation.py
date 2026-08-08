@@ -35,7 +35,7 @@ class EnvironmentMessage:
 
 @dataclass(frozen=True, slots=True)
 class SystemReminderMessage:
-    kind: Literal["plan_mode", "approved_plan"]
+    kind: Literal["plan_mode", "approved_plan", "session_resume"]
     content: str
 
     def render(self) -> str:
@@ -150,8 +150,9 @@ class Conversation:
         active = self._require_active(handle)
         if not active.checkpointed:
             self._messages.append(UserMessage(handle.user))
+            self._messages.append(assistant)
             active.checkpointed = True
-        self._messages.extend((assistant, *results))
+        self._messages.extend(results)
 
     def complete_turn(self, handle: TurnHandle, assistant: AssistantMessage) -> None:
         active = self._require_active(handle)
@@ -176,6 +177,31 @@ class Conversation:
         self._messages.clear()
         self._turns.clear()
         self._active = None
+
+    def restore(self, messages: tuple[ConversationMessage, ...]) -> None:
+        if self._active is not None:
+            raise RuntimeError("Cannot restore over an active conversation turn.")
+        allowed = (UserMessage, AssistantMessage, ToolResultMessage)
+        if any(not isinstance(message, allowed) for message in messages):
+            raise ValueError("Restored history contains a non-canonical message.")
+
+        turns: list[ChatTurn] = []
+        current_user: str | None = None
+        for message in messages:
+            if isinstance(message, UserMessage):
+                current_user = message.content
+            elif (
+                isinstance(message, AssistantMessage)
+                and message.content.strip()
+                and current_user is not None
+            ):
+                turns.append(ChatTurn(current_user, message.content))
+                current_user = None
+
+        self._messages = list(messages)
+        self._turns = turns
+        self._active = None
+        self._next_turn_id = len(turns) + 1
 
     def snapshot(self) -> tuple[ChatTurn, ...]:
         return tuple(self._turns)

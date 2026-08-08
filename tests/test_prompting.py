@@ -22,6 +22,15 @@ def test_builder_sorts_sections_skips_empty_and_is_stable() -> None:
     assert builder.build().encode() == builder.build().encode()
 
 
+def test_builder_with_content_is_immutable() -> None:
+    original = SystemPromptBuilder(DEFAULT_PROMPT_SECTIONS)
+    customized = original.with_content("custom_instructions", "project rule")
+    assert "project rule" not in original.build()
+    assert "project rule" in customized.build()
+    with pytest.raises(KeyError):
+        original.with_content("missing", "x")
+
+
 @pytest.mark.parametrize(
     "sections",
     [

@@ -6,12 +6,15 @@ from pathlib import Path
 from kcode.config import default_config_paths, load_config
 from kcode.conversation import Conversation
 from kcode.errors import ConfigError
+from kcode.history.runtime import SessionCoordinator
+from kcode.instructions import InstructionLoader
 from kcode.mcp import McpManager, McpTrustStore
 from kcode.permissions import (
     LocalPermissionStore,
     PermissionConfigLoader,
     default_permission_paths,
 )
+from kcode.prompting import DEFAULT_PROMPT_SECTIONS, SystemPromptBuilder
 from kcode.providers.factory import create_provider
 from kcode.tools.base import ToolContext
 from kcode.tools.registry import create_default_registry
@@ -40,10 +43,32 @@ def main() -> int:
             for provider_config in config.providers.values()
         ),
     )
+    instruction_bundle = InstructionLoader().load(cwd)
+    instruction_warnings = tuple(
+        f"KCODE.md warning [{warning.code}] {warning.path}: {warning.detail}"
+        for warning in instruction_bundle.warnings
+    )
+    prompt_builder = SystemPromptBuilder(DEFAULT_PROMPT_SECTIONS)
+    if instruction_bundle.content:
+        prompt_builder = prompt_builder.with_content(
+            "custom_instructions",
+            instruction_bundle.content,
+        )
+    coordinator = SessionCoordinator(
+        cwd,
+        provider,
+        sensitive_values=context.sensitive_values,
+        conversation=Conversation(),
+    )
     app = KCodeApp(
         provider,
-        Conversation(),
-        warnings=(*warnings, *permission_settings.warnings, *config.mcp_warnings),
+        coordinator.current.conversation,
+        warnings=(
+            *warnings,
+            *permission_settings.warnings,
+            *config.mcp_warnings,
+            *instruction_warnings,
+        ),
         cwd=cwd,
         registry=registry,
         context=context,
@@ -51,6 +76,8 @@ def main() -> int:
         permission_settings=permission_settings,
         permission_store=LocalPermissionStore(permission_paths[2]),
         mcp_manager=mcp_manager,
+        prompt_builder=prompt_builder,
+        coordinator=coordinator,
     )
     app.run()
     return 0
