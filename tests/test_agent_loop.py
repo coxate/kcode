@@ -442,3 +442,37 @@ async def test_cooperative_cancel_closes_provider_stream(tmp_path) -> None:
     events = await asyncio.wait_for(task, 1)
     assert provider.closed is True
     assert events[-1].reason == AgentStopReason.CANCELLED
+
+
+class RecordingMemory:
+    def __init__(self) -> None:
+        self.turns = []
+
+    def submit_turn(self, turn):
+        self.turns.append(turn)
+        return True
+
+
+async def test_completed_answer_submits_only_normalized_turn_to_memory(tmp_path) -> None:
+    provider = ScriptedProvider([[TextDelta("remembered"), StreamCompleted()]])
+    runner = make_runner(tmp_path, provider)
+    memory = RecordingMemory()
+    runner.bind_memory(memory)
+    events = [event async for event in runner.run("please remember this")]
+    assert any(
+        isinstance(event, AgentStopped) and event.reason == AgentStopReason.COMPLETED
+        for event in events
+    )
+    assert len(memory.turns) == 1
+    assert memory.turns[0].user_text == "please remember this"
+    assert memory.turns[0].final_text == "remembered"
+
+
+async def test_invalid_answer_does_not_submit_memory_turn(tmp_path) -> None:
+    provider = ScriptedProvider([[StreamCompleted()]])
+    runner = make_runner(tmp_path, provider)
+    memory = RecordingMemory()
+    runner.bind_memory(memory)
+    events = [event async for event in runner.run("remember")]
+    assert events[-1].reason == AgentStopReason.INVALID_RESPONSE
+    assert memory.turns == []

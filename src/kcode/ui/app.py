@@ -33,6 +33,8 @@ from kcode.events import (
 from kcode.history.runtime import ResumeResult, SessionCoordinator
 from kcode.mcp import McpManager
 from kcode.mcp.trust import McpTrustRequest
+from kcode.memory.models import MemoryDecision, MemoryStatus
+from kcode.memory.runtime import MemoryCoordinator
 from kcode.orchestration import AgentRunner
 from kcode.permissions import (
     ApprovalChoice,
@@ -51,6 +53,12 @@ from kcode.tools.registry import ToolRegistry, create_default_registry
 from kcode.ui.approval import ApprovalScreen
 from kcode.ui.commands import CommandKind, parse_command
 from kcode.ui.mcp_trust import McpTrustScreen
+from kcode.ui.memory import (
+    MemoryDeleteScreen,
+    MemoryEditScreen,
+    MemoryReviewScreen,
+    MemoryScreen,
+)
 from kcode.ui.resume import ResumeScreen
 from kcode.ui.widgets import AssistantResponse, ChatMessageWidget, ToolCallWidget
 
@@ -87,6 +95,7 @@ class KCodeApp(App[None]):
     BINDINGS = [
         Binding("ctrl+c", "interrupt", "Cancel / Exit", show=False, priority=True),
         Binding("shift+tab", "cycle_permissions", "Permissions", show=False, priority=True),
+        Binding("ctrl+m", "memory", "Memory", show=False, priority=True),
     ]
 
     def __init__(
@@ -105,10 +114,12 @@ class KCodeApp(App[None]):
         mcp_manager: McpManager | None = None,
         prompt_builder: SystemPromptBuilder | None = None,
         coordinator: SessionCoordinator | None = None,
+        memory_coordinator: MemoryCoordinator | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
         self.coordinator = coordinator
+        self.memory_coordinator = memory_coordinator
         self.conversation = (
             coordinator.current.conversation
             if coordinator is not None
@@ -146,6 +157,8 @@ class KCodeApp(App[None]):
         )
         if coordinator is not None:
             self.runner.bind_session(coordinator.current)
+        if memory_coordinator is not None:
+            self.runner.bind_memory(memory_coordinator)
         self.generating = False
         self._generation_worker: Worker[None] | None = None
         self._active_response: AssistantResponse | None = None
@@ -153,6 +166,7 @@ class KCodeApp(App[None]):
         self._iteration = 0
         self._usage = TokenUsage()
         self._coordinator_closed = False
+        self._memory_closed = False
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -182,6 +196,10 @@ class KCodeApp(App[None]):
             self.initialize_mcp()
         else:
             self.query_one("#prompt", Input).focus()
+        if self.memory_coordinator is not None:
+            self.monitor_memory()
+            if self.mcp_manager is None and self.memory_coordinator.pending():
+                self.review_memories()
 
     async def on_unmount(self) -> None:
         if self.coordinator is not None and not self._coordinator_closed:
@@ -189,6 +207,11 @@ class KCodeApp(App[None]):
             for warning in warnings:
                 print(f"KCode warning: {warning}", file=sys.stderr)
             self._coordinator_closed = True
+        if self.memory_coordinator is not None and not self._memory_closed:
+            warnings = await asyncio.shield(self.memory_coordinator.close())
+            for warning in warnings:
+                print(f"KCode warning: {warning}", file=sys.stderr)
+            self._memory_closed = True
         if self.mcp_manager is not None:
             await asyncio.shield(self.mcp_manager.close())
 
@@ -216,6 +239,8 @@ class KCodeApp(App[None]):
             self.runner.update_tool_context(self.context)
             if self.coordinator is not None:
                 self.coordinator.update_sensitive_values(self.context.sensitive_values)
+            if self.memory_coordinator is not None:
+                self.memory_coordinator.update_sensitive_values(self.context.sensitive_values)
             for warning in summary.warnings:
                 await self._append_notice(warning, "system")
             self.query_one("#ready", Label).update(summary.message)
@@ -231,6 +256,8 @@ class KCodeApp(App[None]):
         finally:
             prompt.disabled = False
             prompt.focus()
+            if self.memory_coordinator is not None and self.memory_coordinator.pending():
+                self.review_memories()
 
     def _agent_status_text(self, phase: str | None = None) -> str:
         iteration = (
@@ -289,7 +316,8 @@ class KCodeApp(App[None]):
         if kind == CommandKind.HELP:
             await self._append_notice(
                 "命令：`/plan`、`/do`、`/compact`、`/help`、`/clear`、`/exit`、"
-                "`/resume`、`/mcp trust clear`；Shift+Tab 切换权限模式。"
+                "`/resume`、`/mcp trust clear`；Shift+Tab 切换权限模式；"
+                "Ctrl+M 管理长期记忆。"
             )
         elif kind == CommandKind.CLEAR:
             clear_warnings: tuple[str, ...] = ()
@@ -354,6 +382,10 @@ class KCodeApp(App[None]):
                 for warning in await self.coordinator.close():
                     await self._append_notice(warning, "error")
                 self._coordinator_closed = True
+            if self.memory_coordinator is not None and not self._memory_closed:
+                for warning in await self.memory_coordinator.close():
+                    await self._append_notice(warning, "error")
+                self._memory_closed = True
             self.exit()
         elif kind == CommandKind.MCP_TRUST_CLEAR:
             if self.mcp_manager is None:
@@ -388,6 +420,122 @@ class KCodeApp(App[None]):
         if not value:
             prompt.focus()
 
+    @work(exclusive=True, group="memory-monitor")
+    async def monitor_memory(self) -> None:
+        assert self.memory_coordinator is not None
+        while True:
+            await self.memory_coordinator.next_proposal()
+            if not self.generating:
+                self.review_memories()
+
+    @work(exclusive=True, group="memory-review")
+    async def review_memories(self) -> None:
+        if self.memory_coordinator is None or self.generating:
+            return
+        while self.memory_coordinator.pending() and not self.generating:
+            proposal = self.memory_coordinator.pending()[0]
+            records = {record.id: record for record in self.memory_coordinator.records()}
+            targets = tuple(
+                record for target in proposal.target_ids if (record := records.get(target))
+            )
+            decision = await self.push_screen_wait(MemoryReviewScreen(proposal, targets))
+            if decision is None:
+                return
+            await self._apply_memory_decision(decision)
+
+    async def _apply_memory_decision(self, decision: MemoryDecision) -> None:
+        assert self.memory_coordinator is not None
+        result = await self.memory_coordinator.apply(decision)
+        if result.changed:
+            self.runner.update_long_term_memory(result.prompt.content)
+        for warning in result.warnings:
+            await self._append_notice(warning, "error")
+
+    def action_memory(self) -> None:
+        self.open_memory()
+
+    @work(exclusive=True, group="memory-panel")
+    async def open_memory(self) -> None:
+        if self.memory_coordinator is None:
+            await self._append_notice(
+                "长期记忆未启用；请在 ~/.kcode/config.yaml 设置 memory.enabled: true。",
+                "system",
+            )
+            return
+        if self.generating:
+            await self._append_notice("Agent 正在工作，请在本轮完成后打开长期记忆。", "system")
+            return
+        while True:
+            action = await self.push_screen_wait(
+                MemoryScreen(
+                    self.memory_coordinator.records(),
+                    self.memory_coordinator.pending(),
+                    self.memory_coordinator.warnings,
+                )
+            )
+            if action is None:
+                return
+            if action.kind == "review" and action.item_id is not None:
+                proposal = next(
+                    item
+                    for item in self.memory_coordinator.pending()
+                    if item.id == action.item_id
+                )
+                records = {record.id: record for record in self.memory_coordinator.records()}
+                targets = tuple(
+                    record for target in proposal.target_ids if (record := records.get(target))
+                )
+                decision = await self.push_screen_wait(MemoryReviewScreen(proposal, targets))
+                if decision is not None:
+                    await self._apply_memory_decision(decision)
+            elif action.kind == "toggle" and action.scope is not None and action.item_id:
+                record = next(
+                    item for item in self.memory_coordinator.records() if item.id == action.item_id
+                )
+                status = (
+                    MemoryStatus.INACTIVE
+                    if record.status == MemoryStatus.ACTIVE
+                    else MemoryStatus.ACTIVE
+                )
+                result = await self.memory_coordinator.set_status(
+                    action.scope,
+                    action.item_id,
+                    status,
+                )
+                if result.changed:
+                    self.runner.update_long_term_memory(result.prompt.content)
+                for warning in result.warnings:
+                    await self._append_notice(warning, "error")
+            elif action.kind == "delete" and action.scope is not None and action.item_id:
+                record = next(
+                    item for item in self.memory_coordinator.records() if item.id == action.item_id
+                )
+                if await self.push_screen_wait(MemoryDeleteScreen(record)):
+                    result = await self.memory_coordinator.delete(action.scope, action.item_id)
+                    if result.changed:
+                        self.runner.update_long_term_memory(result.prompt.content)
+                    for warning in result.warnings:
+                        await self._append_notice(warning, "error")
+            elif action.kind == "edit" and action.scope is not None and action.item_id:
+                record = next(
+                    item for item in self.memory_coordinator.records() if item.id == action.item_id
+                )
+                values = await self.push_screen_wait(MemoryEditScreen(record))
+                if values is not None:
+                    title, summary, application, body = values
+                    result = await self.memory_coordinator.edit_record(
+                        action.scope,
+                        action.item_id,
+                        title=title,
+                        summary=summary,
+                        application=application,
+                        body=body,
+                    )
+                    if result.changed:
+                        self.runner.update_long_term_memory(result.prompt.content)
+                    for warning in result.warnings:
+                        await self._append_notice(warning, "error")
+
     @work(exclusive=True, group="resume")
     async def _resume_session(self) -> None:
         if self.coordinator is None:
@@ -413,6 +561,8 @@ class KCodeApp(App[None]):
         finally:
             self._set_agent_status()
             self._set_generating(False)
+            if self.memory_coordinator is not None and self.memory_coordinator.pending():
+                self.review_memories()
 
     async def _redraw_resumed_session(self, result: ResumeResult) -> None:
         chat = self.query_one("#chat", VerticalScroll)
@@ -531,6 +681,8 @@ class KCodeApp(App[None]):
             self._active_response = None
             self._generation_worker = None
             self._set_generating(False)
+            if self.memory_coordinator is not None and self.memory_coordinator.pending():
+                self.review_memories()
 
     async def action_interrupt(self) -> None:
         if self.generating and self._generation_worker is not None:

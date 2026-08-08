@@ -4,7 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Sequence
+from typing import Protocol, Sequence
 
 from kcode.context import ContextManager
 from kcode.conversation import ChatTurn, Conversation, SystemReminderMessage
@@ -19,6 +19,10 @@ from kcode.tools.base import ToolDefinition
 
 class SessionResumeError(RuntimeError):
     pass
+
+
+class SessionCloseListener(Protocol):
+    async def session_closed(self, session_id: str, reason: str) -> tuple[str, ...]: ...
 
 
 @dataclass(slots=True)
@@ -52,10 +56,13 @@ class SessionCoordinator:
         *,
         sensitive_values: Sequence[str] = (),
         conversation: Conversation | None = None,
+        close_listeners: Sequence[SessionCloseListener] = (),
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.provider = provider
         self.sensitive_values = tuple(sensitive_values)
+        self.close_listeners = tuple(close_listeners)
+        self._notified_sessions: set[str] = set()
         self.store = SessionStore(self.workspace_root)
         self.current = self._fresh_runtime(conversation=conversation)
 
@@ -73,6 +80,7 @@ class SessionCoordinator:
                 "The previous session could not be fully saved: "
                 f"{self.current.journal.failure_reason or 'unknown error'}"
             )
+        warnings.extend(await self._notify_closed(self.current.session_id, "clear"))
         runtime = await self.new_session()
         return runtime, tuple(warnings)
 
@@ -121,16 +129,19 @@ class SessionCoordinator:
                 "The previous session could not be fully saved: "
                 f"{self.current.journal.failure_reason or 'unknown error'}"
             )
+        warnings.extend(await self._notify_closed(self.current.session_id, "resume"))
         self.current = candidate
         return ResumeResult(candidate, loaded.turns, tuple(warnings))
 
     async def close(self) -> tuple[str, ...]:
-        if await self.current.journal.close("exit"):
-            return ()
-        return (
-            "The current session could not be fully saved: "
-            f"{self.current.journal.failure_reason or 'unknown error'}",
-        )
+        warnings: list[str] = []
+        if not await self.current.journal.close("exit"):
+            warnings.append(
+                "The current session could not be fully saved: "
+                f"{self.current.journal.failure_reason or 'unknown error'}"
+            )
+        warnings.extend(await self._notify_closed(self.current.session_id, "exit"))
+        return tuple(warnings)
 
     def update_sensitive_values(self, values: Sequence[str]) -> None:
         self.sensitive_values = tuple(values)
@@ -187,3 +198,15 @@ class SessionCoordinator:
             context_window=configured_window,
             sensitive_values=self.sensitive_values,
         )
+
+    async def _notify_closed(self, session_id: str, reason: str) -> tuple[str, ...]:
+        if session_id in self._notified_sessions:
+            return ()
+        self._notified_sessions.add(session_id)
+        warnings: list[str] = []
+        for listener in self.close_listeners:
+            try:
+                warnings.extend(await listener.session_closed(session_id, reason))
+            except Exception as exc:
+                warnings.append(f"A session close listener failed: {exc}")
+        return tuple(warnings)

@@ -137,3 +137,24 @@ async def test_resume_precompacts_over_budget_and_failure_keeps_old_runtime(tmp_
     assert failing.current is old_runtime
     assert result.runtime.journal.path.read_bytes() == before
     await failing.close()
+
+
+class RecordingCloseListener:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def session_closed(self, session_id: str, reason: str) -> tuple[str, ...]:
+        self.calls.append((session_id, reason))
+        return ()
+
+
+@pytest.mark.asyncio
+async def test_close_listener_observes_each_old_session_once(tmp_path) -> None:
+    listener = RecordingCloseListener()
+    coordinator = SessionCoordinator(tmp_path, FakeProvider(), close_listeners=(listener,))
+    old_id = coordinator.current.session_id
+    await coordinator.clear()
+    fresh_id = coordinator.current.session_id
+    await coordinator.close()
+    await coordinator.close()
+    assert listener.calls == [(old_id, "clear"), (fresh_id, "exit")]

@@ -9,4 +9,5 @@ __pycache__/
 .kcode/config.yaml
 .kcode/permissions.local.yaml
 .kcode/sessions/
+.kcode/memory/
 .DS_Store

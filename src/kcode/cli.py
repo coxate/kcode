@@ -9,6 +9,7 @@ from kcode.errors import ConfigError
 from kcode.history.runtime import SessionCoordinator
 from kcode.instructions import InstructionLoader
 from kcode.mcp import McpManager, McpTrustStore
+from kcode.memory.runtime import MemoryCoordinator
 from kcode.permissions import (
     LocalPermissionStore,
     PermissionConfigLoader,
@@ -54,11 +55,37 @@ def main() -> int:
             "custom_instructions",
             instruction_bundle.content,
         )
+    memory_coordinator = None
+    memory_warnings: tuple[str, ...] = config.memory_warnings
+    if config.memory.enabled:
+        try:
+            memory_coordinator = MemoryCoordinator(
+                cwd,
+                provider,
+                sensitive_values=context.sensitive_values,
+            )
+            memory_prompt = memory_coordinator.start()
+            memory_warnings = (
+                *memory_warnings,
+                *memory_coordinator.warnings,
+                *memory_prompt.warnings,
+            )
+            prompt_builder = prompt_builder.with_content(
+                "long_term_memory",
+                memory_prompt.content,
+            )
+        except Exception as exc:
+            memory_warnings = (
+                *memory_warnings,
+                f"Long-term memory was disabled after initialization failed: {exc}",
+            )
+            memory_coordinator = None
     coordinator = SessionCoordinator(
         cwd,
         provider,
         sensitive_values=context.sensitive_values,
         conversation=Conversation(),
+        close_listeners=(memory_coordinator,) if memory_coordinator is not None else (),
     )
     app = KCodeApp(
         provider,
@@ -68,6 +95,7 @@ def main() -> int:
             *permission_settings.warnings,
             *config.mcp_warnings,
             *instruction_warnings,
+            *memory_warnings,
         ),
         cwd=cwd,
         registry=registry,
@@ -78,6 +106,7 @@ def main() -> int:
         mcp_manager=mcp_manager,
         prompt_builder=prompt_builder,
         coordinator=coordinator,
+        memory_coordinator=memory_coordinator,
     )
     app.run()
     return 0

@@ -41,6 +41,8 @@ from kcode.events import (
 )
 from kcode.history.models import PersistenceState
 from kcode.history.runtime import SessionRuntime
+from kcode.memory.models import CompletedTurn
+from kcode.memory.runtime import MemoryCoordinator
 from kcode.permissions.models import PermissionMode
 from kcode.prompting import (
     DEFAULT_PROMPT_SECTIONS,
@@ -152,6 +154,7 @@ class AgentRunner:
         )
         self._cancel_event: asyncio.Event | None = None
         self._session_runtime: SessionRuntime | None = None
+        self._memory_coordinator: MemoryCoordinator | None = None
 
     def cancel(self) -> None:
         if self._cancel_event is not None:
@@ -163,6 +166,17 @@ class AgentRunner:
         self._session_runtime = runtime
         self.conversation = runtime.conversation
         self.context_manager = runtime.context_manager
+
+    def bind_memory(self, coordinator: MemoryCoordinator) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind long-term memory while the agent is running.")
+        self._memory_coordinator = coordinator
+
+    def update_long_term_memory(self, content: str) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot update long-term memory while the agent is running.")
+        self.prompt_builder = self.prompt_builder.with_content("long_term_memory", content)
+        self._stable_system = StableSystemMessage(self.prompt_builder.build())
 
     def update_tool_context(self, context: ToolContext) -> None:
         self.context = context
@@ -411,6 +425,23 @@ class AgentRunner:
                         yield TurnNotice(self._persistence_warning(active_runtime))
                     if mode == PermissionMode.PLAN:
                         active_session.record_plan(response.text)
+                    if self._memory_coordinator is not None:
+                        try:
+                            session_id = (
+                                active_runtime.session_id
+                                if active_runtime is not None
+                                else "in-memory"
+                            )
+                            self._memory_coordinator.submit_turn(
+                                CompletedTurn.create(
+                                    session_id,
+                                    user_text,
+                                    response.text,
+                                    mode.value,
+                                )
+                            )
+                        except Exception as exc:
+                            yield TurnNotice(f"Long-term memory extraction was not queued: {exc}")
                     yield AgentProgress(
                         mode,
                         iteration,

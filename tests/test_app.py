@@ -55,7 +55,7 @@ async def test_ac7_fixed_layout_at_80_by_24() -> None:
     app = KCodeApp(FakeProvider(), cwd=None)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        assert "KCode v0.6.0" in str(app.query_one("#banner", Static).content)
+        assert "KCode v0.7.0" in str(app.query_one("#banner", Static).content)
         assert app.query_one("#ready").render().plain == "Ready. Ask me anything."
         assert app.query_one("#prompt-marker", Static).content == "❯"
         assert app.query_one("#prompt", Input).placeholder == "Send a message..."

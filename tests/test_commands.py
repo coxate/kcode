@@ -11,4 +11,5 @@ def test_local_commands_and_plain_text() -> None:
     assert parse_command("/compact").kind == CommandKind.COMPACT
     assert parse_command("/resume").kind == CommandKind.RESUME
     assert parse_command(" /MCP   TRUST clear ").kind == CommandKind.MCP_TRUST_CLEAR
+    assert parse_command("/memory").kind == CommandKind.UNKNOWN
     assert parse_command("/nope").kind == CommandKind.UNKNOWN

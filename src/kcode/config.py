@@ -87,12 +87,20 @@ class AgentConfig(BaseModel):
     max_parallel_tools: int = Field(default=4, ge=1, le=16)
 
 
+class MemoryConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     active_provider: str
     providers: dict[str, ProviderConfig]
     agent: AgentConfig = AgentConfig()
+    memory: MemoryConfig = MemoryConfig()
+    memory_warnings: tuple[str, ...] = ()
     mcp_servers: tuple[McpServerConfig, ...] = ()
     mcp_warnings: tuple[str, ...] = ()
 
@@ -141,6 +149,9 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         value["_mcp_warnings"] = [
             f"KCode ignored invalid MCP settings at {path}: 'mcp_servers' must be a mapping."
         ]
+    memory = value.get("memory", {})
+    if not isinstance(memory, dict):
+        raise ConfigError(f"Invalid config {path}, field 'memory': expected a mapping.")
     return value
 
 
@@ -152,7 +163,9 @@ def _merge_configs(
     agent: dict[str, Any] = {}
     mcp_servers: dict[str, tuple[Literal["user", "project"], Any]] = {}
     mcp_warnings: list[str] = []
-    for _, raw, source in configs:
+    memory: dict[str, Any] = {}
+    memory_warnings: list[str] = []
+    for path, raw, source in configs:
         if "active_provider" in raw:
             active = raw["active_provider"]
         agent.update(raw.get("agent", {}))
@@ -162,10 +175,23 @@ def _merge_configs(
         for name, server in raw.get("mcp_servers", {}).items():
             mcp_servers[name] = (source, server)
         mcp_warnings.extend(raw.get("_mcp_warnings", ()))
+        raw_memory = raw.get("memory", {})
+        if source == "user":
+            memory.update(raw_memory)
+        elif raw_memory.get("enabled") is False:
+            memory["enabled"] = False
+        elif raw_memory.get("enabled") is True and not memory.get("enabled", False):
+            memory_warnings.append(
+                f"KCode ignored memory.enabled: true from project config {path}; "
+                "enable long-term memory in ~/.kcode/config.yaml after reviewing its cost "
+                "and plaintext-storage notice."
+            )
     return {
         "active_provider": active,
         "providers": list(merged.values()),
         "agent": agent,
+        "memory": memory,
+        "memory_warnings": memory_warnings,
         "mcp_servers": mcp_servers,
         "mcp_warnings": mcp_warnings,
     }
@@ -273,6 +299,8 @@ def load_config(
             active_provider=active,
             providers=providers,
             agent=AgentConfig.model_validate(merged["agent"]),
+            memory=MemoryConfig.model_validate(merged["memory"]),
+            memory_warnings=tuple(merged["memory_warnings"]),
             mcp_servers=tuple(mcp_servers),
             mcp_warnings=tuple(mcp_warnings),
         )
