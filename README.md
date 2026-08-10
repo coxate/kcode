@@ -89,7 +89,7 @@ uv run kcode
 uv run python -m kcode
 ```
 
-命令：`/plan`、`/do`、`/compact`、`/resume`、`/help`、`/clear`、`/exit`。Shift+Tab 循环切换四档权限模式，Ctrl+M 打开长期记忆面板。模型生成时按 Ctrl+C 只取消当前任务；空闲时按 Ctrl+C 退出。
+输入 `/help` 可查看 13 条内置命令。输入 `/` 开头的正式命令前缀时会显示补全菜单：Up/Down 选择、Tab 补全、Enter 执行、ESC 关闭。Shift+Tab 循环切换四档权限模式，Ctrl+M 打开长期记忆面板。模型生成时按 Ctrl+C 只取消当前任务；空闲时按 Ctrl+C 退出。
 
 ## 项目指令
 

@@ -87,7 +87,7 @@ async def test_mcp_trust_clear_command_uses_current_project(tmp_path: Path) -> N
         await pilot.press("2")
         await pilot.pause()
         prompt = app.query_one("#prompt", Input)
-        prompt.value = "/mcp trust clear"
+        prompt.value = "/mcp-trust-clear"
         await pilot.press("enter")
         await pilot.pause()
         assert manager.trust_store.cleared

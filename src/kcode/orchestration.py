@@ -190,6 +190,8 @@ class AgentRunner:
     async def compact_context(
         self,
         session: AgentSession | None = None,
+        *,
+        focus: str | None = None,
     ) -> ContextSnapshot:
         if self._cancel_event is not None:
             raise RuntimeError("Cannot compact context while the agent is running.")
@@ -199,6 +201,7 @@ class AgentRunner:
             self.conversation.messages_snapshot(),
             definitions,
             prefix_messages=(self._stable_system,),
+            focus=focus,
         )
 
     def _definitions_for_mode(self, mode: PermissionMode):

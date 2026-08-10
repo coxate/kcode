@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+from kcode.commands.models import (
+    ArgumentPolicy,
+    CommandContext,
+    CommandSpec,
+    CommandType,
+)
+from kcode.commands.registry import CommandRegistry
+
+REVIEW_PROMPT = "请对当前项目的代码进行审查，重点检查正确性、安全性、并发问题和测试缺口。"
+
+
+async def _help(context: CommandContext) -> None:
+    if not context.args:
+        lines = ["可用命令："]
+        lines.extend(
+            f"/{command.name} — {command.description}"
+            for command in context.registry.visible_commands()
+        )
+        await context.host.command_notice("\n".join(lines))
+        return
+    query = context.args.removeprefix("/").casefold()
+    command = context.registry.resolve(query)
+    if command is None or command.hidden:
+        await context.host.command_notice(
+            f"没有名为 `/{context.args.removeprefix('/')}` 的命令。输入 `/help` 查看帮助。",
+            "error",
+        )
+        return
+    aliases = ", ".join(f"/{alias}" for alias in command.aliases) or "无"
+    await context.host.command_notice(
+        "\n".join(
+            (
+                f"名称：/{command.name}",
+                f"别名：{aliases}",
+                f"描述：{command.description}",
+                f"用法：{command.usage}",
+                f"类别：{command.type.value}",
+            )
+        )
+    )
+
+
+async def _status(context: CommandContext) -> None:
+    status = context.host.command_status()
+    input_tokens = status.input_tokens if status.input_tokens is not None else "?"
+    output_tokens = status.output_tokens if status.output_tokens is not None else "?"
+    memories = status.memory_count if status.memory_count is not None else "未启用"
+    await context.host.command_notice(
+        "\n".join(
+            (
+                f"模式：{status.mode}",
+                f"会话 Token：输入 {input_tokens} / 输出 {output_tokens}",
+                f"工具：{status.tool_count}",
+                f"记忆：{memories}",
+                f"模型：{status.model}",
+                f"工作目录：{status.cwd}",
+            )
+        )
+    )
+
+
+async def _memory(context: CommandContext) -> None:
+    inventory = context.host.command_memories()
+    if not inventory.enabled:
+        await context.host.command_notice("长期记忆未启用。")
+        return
+    user = ", ".join(f"{item}.md" for item in inventory.user_ids) or "无"
+    project = ", ".join(f"{item}.md" for item in inventory.project_ids) or "无"
+    await context.host.command_notice(f"user：{user}\nproject：{project}")
+
+
+async def _permission(context: CommandContext) -> None:
+    status = context.host.command_status()
+    await context.host.command_notice(
+        f"当前权限模式：{status.mode}。使用 Shift+Tab 可切换权限模式。"
+    )
+
+
+async def _session(context: CommandContext) -> None:
+    session = context.host.command_session()
+    if not session.enabled:
+        await context.host.command_notice("当前 App 没有启用会话持久化。")
+        return
+    await context.host.command_notice(
+        f"Session ID：{session.session_id}\nJournal：{session.journal_path}"
+    )
+
+
+async def _exit(context: CommandContext) -> None:
+    await context.host.command_exit()
+
+
+async def _plan(context: CommandContext) -> None:
+    context.host.command_enter_plan()
+    await context.host.command_notice("已进入 Plan Mode：只允许读取、查找、搜索和白名单只读命令。")
+    if context.args:
+        await context.host.command_submit_user(context.args)
+
+
+async def _do(context: CommandContext) -> None:
+    has_plan = context.host.command_enter_do()
+    suffix = "，下一条请求将使用最新计划一次。" if has_plan else "。"
+    await context.host.command_notice("已进入 Do Mode" + suffix)
+
+
+async def _compact(context: CommandContext) -> None:
+    await context.host.command_compact(context.args or None)
+
+
+async def _resume(context: CommandContext) -> None:
+    context.host.command_resume()
+
+
+async def _clear(context: CommandContext) -> None:
+    await context.host.command_clear()
+
+
+async def _mcp_trust_clear(context: CommandContext) -> None:
+    await context.host.command_clear_mcp_trust()
+
+
+async def _review(context: CommandContext) -> None:
+    prompt = REVIEW_PROMPT
+    if context.args:
+        prompt += f"\n\n额外关注点：{context.args}"
+    await context.host.command_submit_user(prompt)
+
+
+def create_builtin_registry() -> CommandRegistry:
+    registry = CommandRegistry()
+    definitions = (
+        (
+            "help",
+            ("h", "?"),
+            "查看命令帮助",
+            "/help [命令]",
+            CommandType.LOCAL,
+            ArgumentPolicy.OPTIONAL,
+            "命令",
+            _help,
+        ),
+        (
+            "status",
+            ("s",),
+            "查看当前运行状态",
+            "/status",
+            CommandType.LOCAL,
+            ArgumentPolicy.NONE,
+            None,
+            _status,
+        ),
+        (
+            "memory",
+            (),
+            "查看已加载的长期记忆",
+            "/memory",
+            CommandType.LOCAL,
+            ArgumentPolicy.NONE,
+            None,
+            _memory,
+        ),
+        (
+            "permission",
+            (),
+            "查看当前权限模式",
+            "/permission",
+            CommandType.LOCAL,
+            ArgumentPolicy.NONE,
+            None,
+            _permission,
+        ),
+        (
+            "session",
+            (),
+            "查看当前会话信息",
+            "/session",
+            CommandType.LOCAL,
+            ArgumentPolicy.NONE,
+            None,
+            _session,
+        ),
+        ("exit", (), "退出 KCode", "/exit", CommandType.ACTION, ArgumentPolicy.NONE, None, _exit),
+        (
+            "plan",
+            ("p",),
+            "进入计划模式并可提交任务",
+            "/plan [任务]",
+            CommandType.ACTION,
+            ArgumentPolicy.OPTIONAL,
+            "任务",
+            _plan,
+        ),
+        ("do", (), "返回执行模式", "/do", CommandType.ACTION, ArgumentPolicy.NONE, None, _do),
+        (
+            "compact",
+            ("c",),
+            "压缩当前上下文",
+            "/compact [重点]",
+            CommandType.ACTION,
+            ArgumentPolicy.OPTIONAL,
+            "重点",
+            _compact,
+        ),
+        (
+            "resume",
+            (),
+            "恢复一个历史会话",
+            "/resume",
+            CommandType.ACTION,
+            ArgumentPolicy.NONE,
+            None,
+            _resume,
+        ),
+        (
+            "clear",
+            (),
+            "清空当前会话",
+            "/clear",
+            CommandType.ACTION,
+            ArgumentPolicy.NONE,
+            None,
+            _clear,
+        ),
+        (
+            "mcp-trust-clear",
+            (),
+            "清除当前项目的 MCP 信任",
+            "/mcp-trust-clear",
+            CommandType.ACTION,
+            ArgumentPolicy.NONE,
+            None,
+            _mcp_trust_clear,
+        ),
+        (
+            "review",
+            (),
+            "让 Agent 审查当前项目代码",
+            "/review [关注点]",
+            CommandType.PROMPT,
+            ArgumentPolicy.OPTIONAL,
+            "关注点",
+            _review,
+        ),
+    )
+    for name, aliases, description, usage, kind, policy, hint, handler in definitions:
+        registry.register(
+            CommandSpec(name, aliases, description, usage, kind, policy, handler, hint)
+        )
+    registry.freeze()
+    return registry

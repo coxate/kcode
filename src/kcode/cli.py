@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from kcode.commands import CommandRegistrationError, create_builtin_registry
 from kcode.config import default_config_paths, load_config
 from kcode.conversation import Conversation
 from kcode.errors import ConfigError
@@ -29,8 +30,12 @@ def main() -> int:
         permission_paths = default_permission_paths(Path.cwd())
         permission_settings = PermissionConfigLoader().load(*permission_paths)
         provider, warnings = create_provider(config.active)
+        command_registry = create_builtin_registry()
     except ConfigError as exc:
         print(f"KCode configuration error: {exc}", file=sys.stderr)
+        return 2
+    except CommandRegistrationError as exc:
+        print(f"KCode command registration error: {exc}", file=sys.stderr)
         return 2
     cwd = Path.cwd().resolve()
     registry = create_default_registry()
@@ -99,6 +104,7 @@ def main() -> int:
         ),
         cwd=cwd,
         registry=registry,
+        command_registry=command_registry,
         context=context,
         agent_config=config.agent,
         permission_settings=permission_settings,
