@@ -111,6 +111,7 @@ class ContextManager:
         force_compaction: bool = False,
         reason: CompactionReason = "automatic",
         apply_offload: bool = True,
+        focus: str | None = None,
     ) -> ContextSnapshot:
         async with self._lock:
             canonical = tuple(canonical_messages)
@@ -140,7 +141,9 @@ class ContextManager:
             )
             result: CompactionResult | None = None
             if should_attempt:
-                result = await self._compact_locked(model_messages, tool_tuple, reason)
+                result = await self._compact_locked(
+                    model_messages, tool_tuple, reason, focus=focus
+                )
                 if result.success:
                     if reason == "automatic":
                         self._automatic_failures = 0
@@ -177,6 +180,7 @@ class ContextManager:
         tools: Sequence[ToolDefinition] = (),
         *,
         prefix_messages: Sequence[ConversationMessage] = (),
+        focus: str | None = None,
     ) -> ContextSnapshot:
         return await self.build_snapshot(
             canonical_messages,
@@ -185,6 +189,7 @@ class ContextManager:
             force_compaction=True,
             reason="manual",
             apply_offload=False,
+            focus=focus,
         )
 
     async def emergency_snapshot(
@@ -273,6 +278,8 @@ class ContextManager:
         messages: tuple[ConversationMessage, ...],
         tools: tuple[ToolDefinition, ...],
         reason: CompactionReason,
+        *,
+        focus: str | None = None,
     ) -> CompactionResult:
         if self.compaction_engine is None:
             return CompactionResult(
@@ -298,7 +305,11 @@ class ContextManager:
         if not summary_messages:
             summary_messages = messages
             summary_end = len(messages)
-        result = await self.compaction_engine.compact(summary_messages, source_start=0)
+        result = await self.compaction_engine.compact(
+            summary_messages,
+            source_start=0,
+            focus=focus,
+        )
         if not result.success or result.summary is None or result.rendered_summary is None:
             return result
         self._state = CompactionState(

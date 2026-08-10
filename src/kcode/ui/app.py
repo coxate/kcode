@@ -10,10 +10,18 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Input, Label, Static
+from textual.widgets import Input, Label, OptionList, Static
 from textual.worker import Worker, WorkerCancelled
 
 from kcode import __version__
+from kcode.commands import (
+    CommandDispatcher,
+    CommandRegistry,
+    MemoryInventory,
+    SessionInfo,
+    StatusSnapshot,
+    create_builtin_registry,
+)
 from kcode.config import AgentConfig
 from kcode.conversation import AssistantMessage, Conversation, ToolResultMessage, UserMessage
 from kcode.events import (
@@ -33,7 +41,7 @@ from kcode.events import (
 from kcode.history.runtime import ResumeResult, SessionCoordinator
 from kcode.mcp import McpManager
 from kcode.mcp.trust import McpTrustRequest
-from kcode.memory.models import MemoryDecision, MemoryStatus
+from kcode.memory.models import MemoryDecision, MemoryScope, MemoryStatus
 from kcode.memory.runtime import MemoryCoordinator
 from kcode.orchestration import AgentRunner
 from kcode.permissions import (
@@ -51,7 +59,7 @@ from kcode.tools.base import ApprovalRequest, ToolContext
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry, create_default_registry
 from kcode.ui.approval import ApprovalScreen
-from kcode.ui.commands import CommandKind, parse_command
+from kcode.ui.command_menu import CommandMenu
 from kcode.ui.mcp_trust import McpTrustScreen
 from kcode.ui.memory import (
     MemoryDeleteScreen,
@@ -87,6 +95,15 @@ class KCodeApp(App[None]):
     #prompt-area { height: 3; margin: 0 1; border: round $accent; align-vertical: middle; }
     #prompt-marker { width: 3; padding-left: 1; color: $accent; text-style: bold; }
     #prompt { width: 1fr; border: none; }
+    #command-menu {
+        display: none;
+        height: auto;
+        max-height: 6;
+        margin: 0 1;
+        border: round $accent;
+        background: $surface;
+        scrollbar-size: 1 1;
+    }
     #status { height: 1; dock: bottom; background: $primary-darken-2; color: $text; }
     #permission-status { width: 1fr; padding-left: 1; }
     #agent-status { width: auto; padding-right: 2; }
@@ -96,6 +113,10 @@ class KCodeApp(App[None]):
         Binding("ctrl+c", "interrupt", "Cancel / Exit", show=False, priority=True),
         Binding("shift+tab", "cycle_permissions", "Permissions", show=False, priority=True),
         Binding("ctrl+m", "memory", "Memory", show=False, priority=True),
+        Binding("up", "command_menu_up", "Previous command", show=False, priority=True),
+        Binding("down", "command_menu_down", "Next command", show=False, priority=True),
+        Binding("tab", "command_menu_complete", "Complete command", show=False, priority=True),
+        Binding("escape", "command_menu_close", "Close commands", show=False, priority=True),
     ]
 
     def __init__(
@@ -106,6 +127,7 @@ class KCodeApp(App[None]):
         warnings: tuple[str, ...] = (),
         cwd: Path | None = None,
         registry: ToolRegistry | None = None,
+        command_registry: CommandRegistry | None = None,
         context: ToolContext | None = None,
         agent_config: AgentConfig | None = None,
         session: AgentSession | None = None,
@@ -128,6 +150,8 @@ class KCodeApp(App[None]):
         self.startup_warnings = warnings
         self.cwd = (cwd or Path.cwd()).resolve()
         self.registry = registry or create_default_registry()
+        self.command_registry = command_registry or create_builtin_registry()
+        self.command_dispatcher = CommandDispatcher(self.command_registry)
         self.context = context or ToolContext(self.cwd)
         self.agent_config = agent_config or AgentConfig()
         if permission_settings is None:
@@ -165,6 +189,7 @@ class KCodeApp(App[None]):
         self._tool_widgets: dict[str, ToolCallWidget] = {}
         self._iteration = 0
         self._usage = TokenUsage()
+        self._session_usage = TokenUsage(0, 0, 0, 0, 0)
         self._coordinator_closed = False
         self._memory_closed = False
 
@@ -183,6 +208,7 @@ class KCodeApp(App[None]):
                 id="prompt",
                 disabled=self.mcp_manager is not None,
             )
+        yield CommandMenu(self.command_registry)
         with Horizontal(id="status"):
             yield Static(self._permission_status_text(), id="permission-status")
             yield Static(self._agent_status_text(), id="agent-status")
@@ -297,11 +323,51 @@ class KCodeApp(App[None]):
         text = event.value.strip()
         if not text or self.generating:
             return
+        menu = self.query_one("#command-menu", CommandMenu)
+        if menu.display:
+            selected = menu.selected_name()
+            if selected is not None:
+                text = f"/{selected}"
+            menu.close()
         event.input.value = ""
-        command = parse_command(text)
-        if command is not None:
-            await self._run_command(command.kind, command.raw)
+        if await self.command_dispatcher.dispatch(text, self):
             return
+        await self._submit_user_text(text)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "prompt" and not self.generating:
+            self.query_one("#command-menu", CommandMenu).update_query(event.value)
+
+    def _command_menu_active(self) -> bool:
+        if len(self.screen_stack) != 1:
+            return False
+        prompt = self.query_one("#prompt", Input)
+        return self.focused is prompt and self.query_one("#command-menu").display
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action.startswith("command_menu_"):
+            return self._command_menu_active()
+        return super().check_action(action, parameters)
+
+    def action_command_menu_up(self) -> None:
+        self.query_one("#command-menu", OptionList).action_cursor_up()
+
+    def action_command_menu_down(self) -> None:
+        self.query_one("#command-menu", OptionList).action_cursor_down()
+
+    def action_command_menu_complete(self) -> None:
+        menu = self.query_one("#command-menu", CommandMenu)
+        selected = menu.selected_name()
+        if selected is not None:
+            prompt = self.query_one("#prompt", Input)
+            prompt.value = f"/{selected} "
+            prompt.cursor_position = len(prompt.value)
+        menu.close()
+
+    def action_command_menu_close(self) -> None:
+        self.query_one("#command-menu", CommandMenu).close()
+
+    async def _submit_user_text(self, text: str) -> None:
         self._iteration = 0
         self._usage = TokenUsage()
         self._set_agent_status()
@@ -312,103 +378,133 @@ class KCodeApp(App[None]):
         self._set_generating(True)
         self._generation_worker = self.generate_response(text, response)
 
-    async def _run_command(self, kind: CommandKind, raw: str) -> None:
-        if kind == CommandKind.HELP:
-            await self._append_notice(
-                "命令：`/plan`、`/do`、`/compact`、`/help`、`/clear`、`/exit`、"
-                "`/resume`、`/mcp trust clear`；Shift+Tab 切换权限模式；"
-                "Ctrl+M 管理长期记忆。"
-            )
-        elif kind == CommandKind.CLEAR:
-            clear_warnings: tuple[str, ...] = ()
-            if self.coordinator is None:
-                self.conversation.clear()
-                await self.runner.clear_context()
+    async def command_notice(self, text: str, style: str = "system") -> None:
+        await self._append_notice(text, style)
+
+    async def command_submit_user(self, text: str) -> None:
+        await self._submit_user_text(text)
+
+    def command_enter_plan(self) -> None:
+        self.session.set_mode(PermissionMode.PLAN)
+        self._iteration = 0
+        self._set_permission_status()
+        self._set_agent_status()
+
+    def command_enter_do(self) -> bool:
+        has_plan = self.session.approve_plan()
+        self._iteration = 0
+        self._set_permission_status()
+        self._set_agent_status()
+        return has_plan
+
+    async def command_compact(self, focus: str | None) -> None:
+        self._set_generating(True)
+        self._set_agent_status("压缩上下文")
+        try:
+            snapshot = await self.runner.compact_context(self.session, focus=focus)
+            result = snapshot.compaction_result
+            if result is None or not result.success:
+                detail = result.failure_reason if result is not None else "没有可压缩历史"
+                await self._append_notice(f"上下文压缩失败：{detail}", "error")
             else:
-                runtime, clear_warnings = await self.coordinator.clear()
-                self.runner.bind_session(runtime)
-                self.conversation = runtime.conversation
-            self.session.clear()
-            self._iteration = 0
-            self._usage = TokenUsage()
-            await self.query_one("#chat", VerticalScroll).remove_children()
-            for warning in clear_warnings:
-                await self._append_notice(warning, "error")
-            self._set_permission_status()
-            self._set_agent_status()
-        elif kind == CommandKind.RESUME:
-            self._resume_session()
-        elif kind == CommandKind.PLAN:
-            self.session.set_mode(PermissionMode.PLAN)
-            self._iteration = 0
-            self._set_permission_status()
-            self._set_agent_status()
-            await self._append_notice("已进入 Plan Mode：只允许读取、查找、搜索和白名单只读命令。")
-        elif kind == CommandKind.DO:
-            has_plan = self.session.approve_plan()
-            self._iteration = 0
-            self._set_permission_status()
-            self._set_agent_status()
-            suffix = "，下一条请求将使用最新计划一次。" if has_plan else "。"
-            await self._append_notice("已进入 Do Mode" + suffix)
-        elif kind == CommandKind.COMPACT:
-            self._set_generating(True)
-            self._set_agent_status("压缩上下文")
-            try:
-                snapshot = await self.runner.compact_context(self.session)
-                result = snapshot.compaction_result
-                if result is None or not result.success:
-                    detail = result.failure_reason if result is not None else "没有可压缩历史"
-                    await self._append_notice(f"上下文压缩失败：{detail}", "error")
-                else:
-                    await self._append_notice(
-                        "上下文压缩完成："
-                        f"约 {result.before_tokens} → {result.after_tokens or '?'} Token；"
-                        f"置信度 {snapshot.budget.confidence}；"
-                        f"history_incomplete={str(result.history_incomplete).lower()}；"
-                        f"Artifact {snapshot.offloaded_count} 个。",
-                        "system",
-                    )
-            except Exception as exc:
                 await self._append_notice(
-                    f"上下文压缩失败：{exc.__class__.__name__}。",
-                    "error",
+                    "上下文压缩完成："
+                    f"约 {result.before_tokens} → {result.after_tokens or '?'} Token；"
+                    f"置信度 {snapshot.budget.confidence}；"
+                    f"history_incomplete={str(result.history_incomplete).lower()}；"
+                    f"Artifact {snapshot.offloaded_count} 个。"
                 )
-            finally:
-                self._set_agent_status()
-                self._set_generating(False)
-        elif kind == CommandKind.EXIT:
-            if self.coordinator is not None and not self._coordinator_closed:
-                for warning in await self.coordinator.close():
-                    await self._append_notice(warning, "error")
-                self._coordinator_closed = True
-            if self.memory_coordinator is not None and not self._memory_closed:
-                for warning in await self.memory_coordinator.close():
-                    await self._append_notice(warning, "error")
-                self._memory_closed = True
-            self.exit()
-        elif kind == CommandKind.MCP_TRUST_CLEAR:
-            if self.mcp_manager is None:
-                await self._append_notice("当前项目没有配置 MCP Server。", "system")
-            else:
-                try:
-                    removed = await asyncio.to_thread(
-                        self.mcp_manager.trust_store.clear_project,
-                        self.cwd,
-                    )
-                    message = (
-                        "已清除当前项目的 MCP 信任；重启 KCode 后将重新确认。"
-                        if removed
-                        else "当前项目没有已保存的 MCP 信任。"
-                    )
-                    await self._append_notice(message, "system")
-                except OSError:
-                    await self._append_notice(
-                        "无法安全清除 MCP 信任，请检查 ~/.kcode 目录权限。",
-                        "error",
-                    )
+        finally:
+            self._set_agent_status()
+            self._set_generating(False)
+
+    async def command_clear(self) -> None:
+        clear_warnings: tuple[str, ...] = ()
+        if self.coordinator is None:
+            self.conversation.clear()
+            await self.runner.clear_context()
         else:
-            await self._append_notice(f"未知命令：{raw}。输入 `/help` 查看帮助。", "error")
+            runtime, clear_warnings = await self.coordinator.clear()
+            self.runner.bind_session(runtime)
+            self.conversation = runtime.conversation
+        self.session.clear()
+        self._iteration = 0
+        self._usage = TokenUsage()
+        self._session_usage = TokenUsage(0, 0, 0, 0, 0)
+        await self.query_one("#chat", VerticalScroll).remove_children()
+        await self._append_notice("当前会话已清空。")
+        for warning in clear_warnings:
+            await self._append_notice(warning, "error")
+        self._set_permission_status()
+        self._set_agent_status()
+
+    def command_resume(self) -> None:
+        self._resume_session()
+
+    async def command_exit(self) -> None:
+        if self.coordinator is not None and not self._coordinator_closed:
+            for warning in await self.coordinator.close():
+                await self._append_notice(warning, "error")
+            self._coordinator_closed = True
+        if self.memory_coordinator is not None and not self._memory_closed:
+            for warning in await self.memory_coordinator.close():
+                await self._append_notice(warning, "error")
+            self._memory_closed = True
+        self.exit()
+
+    async def command_clear_mcp_trust(self) -> None:
+        if self.mcp_manager is None:
+            await self._append_notice("当前项目没有配置 MCP Server。")
+            return
+        try:
+            removed = await asyncio.to_thread(
+                self.mcp_manager.trust_store.clear_project,
+                self.cwd,
+            )
+            message = (
+                "已清除当前项目的 MCP 信任；重启 KCode 后将重新确认。"
+                if removed
+                else "当前项目没有已保存的 MCP 信任。"
+            )
+            await self._append_notice(message)
+        except OSError:
+            await self._append_notice(
+                "无法安全清除 MCP 信任，请检查 ~/.kcode 目录权限。", "error"
+            )
+
+    def command_status(self) -> StatusSnapshot:
+        memory_count = (
+            len(self.memory_coordinator.records())
+            if self.memory_coordinator is not None
+            else None
+        )
+        return StatusSnapshot(
+            mode=self.session.permission_mode.value,
+            input_tokens=self._session_usage.input_tokens,
+            output_tokens=self._session_usage.output_tokens,
+            tool_count=len(self.registry),
+            memory_count=memory_count,
+            model=self.provider.model_name,
+            cwd=str(self.cwd),
+        )
+
+    def command_memories(self) -> MemoryInventory:
+        if self.memory_coordinator is None:
+            return MemoryInventory(False)
+        records = self.memory_coordinator.records()
+        return MemoryInventory(
+            True,
+            tuple(sorted(record.id for record in records if record.scope is MemoryScope.USER)),
+            tuple(
+                sorted(record.id for record in records if record.scope is MemoryScope.PROJECT)
+            ),
+        )
+
+    def command_session(self) -> SessionInfo:
+        if self.coordinator is None:
+            return SessionInfo(False)
+        runtime = self.coordinator.current
+        return SessionInfo(True, runtime.session_id, str(runtime.journal.path))
 
     def _set_generating(self, value: bool) -> None:
         self.generating = value
@@ -588,6 +684,7 @@ class KCodeApp(App[None]):
             await self._append_notice(warning, "system")
         self._iteration = 0
         self._usage = TokenUsage()
+        self._session_usage = TokenUsage(0, 0, 0, 0, 0)
         self._set_agent_status()
 
     @work(exclusive=True, group="generation")
@@ -623,6 +720,7 @@ class KCodeApp(App[None]):
                             thinking = ""
                 elif isinstance(event, TokenUsageUpdated):
                     self._usage = event.cumulative
+                    self._session_usage = self._session_usage.plus(event.request)
                     self._set_agent_status()
                 elif isinstance(event, ToolCallReady):
                     # 结构化工具调用出现后清除可能泄漏的临时协议文本。
