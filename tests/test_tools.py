@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from kcode.skills.runtime import SkillRuntime
+from kcode.skills.tools import LoadSkillTool
 from kcode.tools.base import (
     EditFileArgs,
     FindFilesArgs,
@@ -27,6 +29,16 @@ def test_default_registry_contains_six_tools_and_schemas() -> None:
         "search_code",
     ]
     assert all(item.parameters["additionalProperties"] is False for item in registry.definitions())
+
+
+def test_restricted_registry_keeps_always_visible_tools() -> None:
+    registry = create_default_registry()
+    load_skill = LoadSkillTool(SkillRuntime())
+    registry.register(load_skill)
+    view = registry.restricted_view({"read_file"})
+    assert view.names() == {"read_file", "load_skill"}
+    assert view.get("load_skill") is load_skill
+    assert view.get("write_file") is None
 
 
 def test_tool_descriptions_reinforce_purpose_built_tools_and_read_before_edit() -> None:

@@ -1,4 +1,4 @@
-from kcode.commands.builtins import REVIEW_PROMPT, create_builtin_registry
+from kcode.commands.builtins import create_builtin_registry, register_skill_commands
 from kcode.commands.models import (
     ArgumentPolicy,
     CommandContext,
@@ -19,7 +19,6 @@ from kcode.commands.registry import (
 
 __all__ = [
     "MAX_ARGUMENT_LENGTH",
-    "REVIEW_PROMPT",
     "ArgumentPolicy",
     "CommandContext",
     "CommandDispatcher",
@@ -33,4 +32,5 @@ __all__ = [
     "SessionInfo",
     "StatusSnapshot",
     "create_builtin_registry",
+    "register_skill_commands",
 ]

@@ -32,6 +32,7 @@ class SessionRuntime:
     context_manager: ContextManager
     journal: SessionJournal
     resume_reminder: SystemReminderMessage | None = None
+    active_skill_names: tuple[str, ...] = ()
 
     @property
     def session_id(self) -> str:
@@ -39,6 +40,10 @@ class SessionRuntime:
 
     def consume_resume_reminder(self) -> None:
         self.resume_reminder = None
+
+    async def record_skill_state(self, names: tuple[str, ...]) -> bool:
+        self.active_skill_names = names
+        return await self.journal.append_skill_state(names)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +191,7 @@ class SessionCoordinator:
             context_manager,
             journal,
             build_session_resume_reminder(loaded.last_active_at),
+            loaded.active_skill_names,
         )
 
     def _context_manager(self, session_id: str) -> ContextManager:

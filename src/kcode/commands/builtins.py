@@ -8,8 +8,6 @@ from kcode.commands.models import (
 )
 from kcode.commands.registry import CommandRegistry
 
-REVIEW_PROMPT = "请对当前项目的代码进行审查，重点检查正确性、安全性、并发问题和测试缺口。"
-
 
 async def _help(context: CommandContext) -> None:
     if not context.args:
@@ -121,14 +119,37 @@ async def _mcp_trust_clear(context: CommandContext) -> None:
     await context.host.command_clear_mcp_trust()
 
 
-async def _review(context: CommandContext) -> None:
-    prompt = REVIEW_PROMPT
-    if context.args:
-        prompt += f"\n\n额外关注点：{context.args}"
-    await context.host.command_submit_user(prompt)
+async def _skill(context: CommandContext) -> None:
+    skills = context.host.command_skills()
+    if not skills:
+        await context.host.command_notice("当前没有可用 Skill。")
+        return
+    await context.host.command_notice(
+        "可用 Skills：\n" + "\n".join(f"/{item.name} — {item.description}" for item in skills)
+    )
 
 
-def create_builtin_registry() -> CommandRegistry:
+def register_skill_commands(registry: CommandRegistry, skills) -> None:
+    for skill in skills:
+
+        async def execute(context: CommandContext, name: str = skill.name) -> None:
+            await context.host.command_execute_skill(name, context.args)
+
+        registry.register(
+            CommandSpec(
+                skill.name,
+                (),
+                skill.description,
+                f"/{skill.name} [参数]",
+                CommandType.PROMPT,
+                ArgumentPolicy.OPTIONAL,
+                execute,
+                "参数",
+            )
+        )
+
+
+def create_builtin_registry(*, freeze: bool = True) -> CommandRegistry:
     registry = CommandRegistry()
     definitions = (
         (
@@ -234,19 +255,20 @@ def create_builtin_registry() -> CommandRegistry:
             _mcp_trust_clear,
         ),
         (
-            "review",
+            "skill",
             (),
-            "让 Agent 审查当前项目代码",
-            "/review [关注点]",
-            CommandType.PROMPT,
-            ArgumentPolicy.OPTIONAL,
-            "关注点",
-            _review,
+            "查看可用 Skill",
+            "/skill",
+            CommandType.LOCAL,
+            ArgumentPolicy.NONE,
+            None,
+            _skill,
         ),
     )
     for name, aliases, description, usage, kind, policy, hint, handler in definitions:
         registry.register(
             CommandSpec(name, aliases, description, usage, kind, policy, handler, hint)
         )
-    registry.freeze()
+    if freeze:
+        registry.freeze()
     return registry

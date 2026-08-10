@@ -80,8 +80,14 @@ class SessionEndRecord(StrictRecord):
     reason: str
 
 
+class SkillStateRecord(StrictRecord):
+    type: Literal["skill_state"]
+    ts: float
+    names: tuple[str, ...]
+
+
 JournalRecord = Annotated[
-    SessionRecord | MessageRecord | SessionEndRecord,
+    SessionRecord | MessageRecord | SessionEndRecord | SkillStateRecord,
     Field(discriminator="type"),
 ]
 
@@ -115,6 +121,7 @@ class LoadedSession:
     warnings: tuple[str, ...]
     last_active_at: float
     skipped_lines: int = 0
+    active_skill_names: tuple[str, ...] = ()
 
 
 class PersistenceState(StrEnum):

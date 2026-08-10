@@ -44,6 +44,13 @@ class CommandRegistry:
     def freeze(self) -> None:
         self._frozen = True
 
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
+    def registered_names(self) -> set[str]:
+        return set(self._lookup)
+
     def resolve(self, name: str) -> CommandSpec | None:
         return self._lookup.get(name.casefold())
 

@@ -21,6 +21,7 @@ from kcode.commands import (
     SessionInfo,
     StatusSnapshot,
     create_builtin_registry,
+    register_skill_commands,
 )
 from kcode.config import AgentConfig
 from kcode.conversation import AssistantMessage, Conversation, ToolResultMessage, UserMessage
@@ -55,6 +56,15 @@ from kcode.permissions import (
 from kcode.prompting import SystemPromptBuilder
 from kcode.providers.base import ChatProvider
 from kcode.session import AgentSession
+from kcode.skills import (
+    LoadSkillTool,
+    SkillCatalogBuilder,
+    SkillExecutor,
+    SkillMode,
+    SkillRuntime,
+    SkillTrustStore,
+)
+from kcode.skills.executor import SkillInvocation
 from kcode.tools.base import ApprovalRequest, ToolContext
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry, create_default_registry
@@ -68,6 +78,7 @@ from kcode.ui.memory import (
     MemoryScreen,
 )
 from kcode.ui.resume import ResumeScreen
+from kcode.ui.skill_trust import SkillTrustScreen
 from kcode.ui.widgets import AssistantResponse, ChatMessageWidget, ToolCallWidget
 
 CAT_BANNER = r""" /\_/\
@@ -137,6 +148,8 @@ class KCodeApp(App[None]):
         prompt_builder: SystemPromptBuilder | None = None,
         coordinator: SessionCoordinator | None = None,
         memory_coordinator: MemoryCoordinator | None = None,
+        skill_builder: SkillCatalogBuilder | None = None,
+        skill_trust_store: SkillTrustStore | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -150,7 +163,7 @@ class KCodeApp(App[None]):
         self.startup_warnings = warnings
         self.cwd = (cwd or Path.cwd()).resolve()
         self.registry = registry or create_default_registry()
-        self.command_registry = command_registry or create_builtin_registry()
+        self.command_registry = command_registry or create_builtin_registry(freeze=False)
         self.command_dispatcher = CommandDispatcher(self.command_registry)
         self.context = context or ToolContext(self.cwd)
         self.agent_config = agent_config or AgentConfig()
@@ -161,6 +174,12 @@ class KCodeApp(App[None]):
             permission_settings.layers[0].path
         )
         self.mcp_manager = mcp_manager
+        self.skill_builder = skill_builder or SkillCatalogBuilder(self.cwd)
+        self.skill_trust_store = skill_trust_store or SkillTrustStore()
+        self.skill_runtime = SkillRuntime()
+        if self.registry.get("load_skill") is None:
+            self.registry.register(LoadSkillTool(self.skill_runtime))
+        self.skill_executor = SkillExecutor(self.skill_runtime)
         self.permission_engine = PermissionEngine(permission_settings)
         self.session = session or AgentSession(
             permission_settings.initial_mode,
@@ -183,6 +202,7 @@ class KCodeApp(App[None]):
             self.runner.bind_session(coordinator.current)
         if memory_coordinator is not None:
             self.runner.bind_memory(memory_coordinator)
+        self.runner.bind_skills(self.skill_runtime)
         self.generating = False
         self._generation_worker: Worker[None] | None = None
         self._active_response: AssistantResponse | None = None
@@ -192,6 +212,7 @@ class KCodeApp(App[None]):
         self._session_usage = TokenUsage(0, 0, 0, 0, 0)
         self._coordinator_closed = False
         self._memory_closed = False
+        self._startup_complete = False
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -206,7 +227,7 @@ class KCodeApp(App[None]):
             yield Input(
                 placeholder="Send a message...",
                 id="prompt",
-                disabled=self.mcp_manager is not None,
+                disabled=True,
             )
         yield CommandMenu(self.command_registry)
         with Horizontal(id="status"):
@@ -217,15 +238,10 @@ class KCodeApp(App[None]):
     async def on_mount(self) -> None:
         for warning in self.startup_warnings:
             await self._append_notice(warning, "system")
-        if self.mcp_manager is not None:
-            self.query_one("#ready", Label).update("正在检查 MCP Server…")
-            self.initialize_mcp()
-        else:
-            self.query_one("#prompt", Input).focus()
+        self.query_one("#ready", Label).update("正在检查 Skills 与 MCP Server…")
+        self.initialize_mcp()
         if self.memory_coordinator is not None:
             self.monitor_memory()
-            if self.mcp_manager is None and self.memory_coordinator.pending():
-                self.review_memories()
 
     async def on_unmount(self) -> None:
         if self.coordinator is not None and not self._coordinator_closed:
@@ -244,41 +260,77 @@ class KCodeApp(App[None]):
     async def _request_mcp_trust(self, request: McpTrustRequest) -> bool:
         return await self.push_screen_wait(McpTrustScreen(request))
 
+    async def _request_skill_trust(self, request) -> bool:
+        return await self.push_screen_wait(SkillTrustScreen(request))
+
     @work(exclusive=True, group="mcp-startup")
     async def initialize_mcp(self) -> None:
-        assert self.mcp_manager is not None
         prompt = self.query_one("#prompt", Input)
+        project_trusted = False
         try:
-            await self.mcp_manager.prepare(self._request_mcp_trust)
-            summary = await self.mcp_manager.connect_all()
-            for tool in summary.tools:
-                try:
-                    self.registry.register(tool)
-                except ValueError as exc:
-                    await self._append_notice(f"KCode ignored an MCP tool: {exc}", "system")
-            self.context = replace(
-                self.context,
-                sensitive_values=tuple(
-                    dict.fromkeys((*self.context.sensitive_values, *summary.sensitive_values))
-                ),
-            )
-            self.runner.update_tool_context(self.context)
-            if self.coordinator is not None:
-                self.coordinator.update_sensitive_values(self.context.sensitive_values)
-            if self.memory_coordinator is not None:
-                self.memory_coordinator.update_sensitive_values(self.context.sensitive_values)
-            for warning in summary.warnings:
+            request, trust_warnings = self.skill_builder.trust_request()
+            for warning in trust_warnings:
                 await self._append_notice(warning, "system")
-            self.query_one("#ready", Label).update(summary.message)
+            if request is not None:
+                project_trusted = self.skill_trust_store.is_trusted(request)
+                if not project_trusted:
+                    project_trusted = await self._request_skill_trust(request)
+                    if project_trusted:
+                        try:
+                            await asyncio.to_thread(self.skill_trust_store.trust, request)
+                        except (OSError, ValueError):
+                            project_trusted = False
+                            await self._append_notice(
+                                "无法安全保存项目 Skill 信任；已跳过项目 Skills。",
+                                "error",
+                            )
+            ready_message = "Ready. Ask me anything."
+            if self.mcp_manager is not None:
+                await self.mcp_manager.prepare(self._request_mcp_trust)
+                summary = await self.mcp_manager.connect_all()
+                for tool in summary.tools:
+                    try:
+                        self.registry.register(tool)
+                    except ValueError as exc:
+                        await self._append_notice(f"KCode ignored an MCP tool: {exc}", "system")
+                self.context = replace(
+                    self.context,
+                    sensitive_values=tuple(
+                        dict.fromkeys((*self.context.sensitive_values, *summary.sensitive_values))
+                    ),
+                )
+                self.runner.update_tool_context(self.context)
+                if self.coordinator is not None:
+                    self.coordinator.update_sensitive_values(self.context.sensitive_values)
+                if self.memory_coordinator is not None:
+                    self.memory_coordinator.update_sensitive_values(self.context.sensitive_values)
+                for warning in summary.warnings:
+                    await self._append_notice(warning, "system")
+                ready_message = summary.message
+            catalog = self.skill_builder.build(
+                project_trusted=project_trusted,
+                tool_names=self.registry.names(),
+                command_names=self.command_registry.registered_names(),
+            )
+            self.skill_runtime.set_catalog(catalog)
+            self.runner.update_available_skills(catalog.available_prompt())
+            register_skill_commands(self.command_registry, catalog.summaries())
+            self.command_registry.freeze()
+            for warning in catalog.warnings:
+                await self._append_notice(warning, "system")
+            self.query_one("#ready", Label).update(ready_message)
+            self._startup_complete = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await self._append_notice(
-                f"KCode could not initialize MCP; built-in tools remain available: "
+                f"KCode could not finish startup; built-in tools remain available: "
                 f"{exc.__class__.__name__}.",
                 "error",
             )
-            self.query_one("#ready", Label).update("Ready. MCP initialization failed.")
+            if not self.command_registry.frozen:
+                self.command_registry.freeze()
+            self.query_one("#ready", Label).update("Ready. Skill/MCP initialization failed.")
         finally:
             prompt.disabled = False
             prompt.focus()
@@ -367,11 +419,13 @@ class KCodeApp(App[None]):
     def action_command_menu_close(self) -> None:
         self.query_one("#command-menu", CommandMenu).close()
 
-    async def _submit_user_text(self, text: str) -> None:
+    async def _submit_user_text(self, text: str, display_text: str | None = None) -> None:
         self._iteration = 0
         self._usage = TokenUsage()
         self._set_agent_status()
-        await self.query_one("#chat", VerticalScroll).mount(ChatMessageWidget("user", text))
+        await self.query_one("#chat", VerticalScroll).mount(
+            ChatMessageWidget("user", display_text or text)
+        )
         response = AssistantResponse()
         await self.query_one("#chat", VerticalScroll).mount(response)
         self._active_response = response
@@ -381,8 +435,42 @@ class KCodeApp(App[None]):
     async def command_notice(self, text: str, style: str = "system") -> None:
         await self._append_notice(text, style)
 
-    async def command_submit_user(self, text: str) -> None:
-        await self._submit_user_text(text)
+    async def command_submit_user(
+        self,
+        text: str,
+        display_text: str | None = None,
+    ) -> None:
+        await self._submit_user_text(text, display_text)
+
+    def command_skills(self):
+        return self.skill_runtime.catalog.summaries()
+
+    async def command_execute_skill(self, name: str, args: str) -> None:
+        try:
+            invocation = self.skill_executor.prepare(name, args)
+        except ValueError as exc:
+            await self._append_notice(str(exc), "error")
+            return
+        for warning in invocation.warnings:
+            await self._append_notice(warning, "system")
+        if invocation.mode is SkillMode.INLINE:
+            await self._submit_user_text(invocation.prompt, invocation.display_text)
+            return
+        await self._submit_fork(invocation)
+
+    async def _submit_fork(self, invocation: SkillInvocation) -> None:
+        self._iteration = 0
+        self._usage = TokenUsage()
+        self._set_agent_status()
+        await self.query_one("#chat", VerticalScroll).mount(
+            ChatMessageWidget("user", invocation.display_text)
+        )
+        response = AssistantResponse()
+        await self.query_one("#chat", VerticalScroll).mount(response)
+        self._active_response = response
+        self._set_generating(True)
+        events = self.skill_executor.run_fork(invocation, self.runner, self.session)
+        self._generation_worker = self.generate_response("", response, event_source=events)
 
     def command_enter_plan(self) -> None:
         self.session.set_mode(PermissionMode.PLAN)
@@ -420,12 +508,14 @@ class KCodeApp(App[None]):
 
     async def command_clear(self) -> None:
         clear_warnings: tuple[str, ...] = ()
+        skill_warnings: tuple[str, ...] = ()
         if self.coordinator is None:
             self.conversation.clear()
             await self.runner.clear_context()
+            self.skill_runtime.restore(())
         else:
             runtime, clear_warnings = await self.coordinator.clear()
-            self.runner.bind_session(runtime)
+            skill_warnings = self.runner.bind_session(runtime)
             self.conversation = runtime.conversation
         self.session.clear()
         self._iteration = 0
@@ -435,6 +525,8 @@ class KCodeApp(App[None]):
         await self._append_notice("当前会话已清空。")
         for warning in clear_warnings:
             await self._append_notice(warning, "error")
+        for warning in skill_warnings:
+            await self._append_notice(warning, "system")
         self._set_permission_status()
         self._set_agent_status()
 
@@ -468,15 +560,11 @@ class KCodeApp(App[None]):
             )
             await self._append_notice(message)
         except OSError:
-            await self._append_notice(
-                "无法安全清除 MCP 信任，请检查 ~/.kcode 目录权限。", "error"
-            )
+            await self._append_notice("无法安全清除 MCP 信任，请检查 ~/.kcode 目录权限。", "error")
 
     def command_status(self) -> StatusSnapshot:
         memory_count = (
-            len(self.memory_coordinator.records())
-            if self.memory_coordinator is not None
-            else None
+            len(self.memory_coordinator.records()) if self.memory_coordinator is not None else None
         )
         return StatusSnapshot(
             mode=self.session.permission_mode.value,
@@ -495,9 +583,7 @@ class KCodeApp(App[None]):
         return MemoryInventory(
             True,
             tuple(sorted(record.id for record in records if record.scope is MemoryScope.USER)),
-            tuple(
-                sorted(record.id for record in records if record.scope is MemoryScope.PROJECT)
-            ),
+            tuple(sorted(record.id for record in records if record.scope is MemoryScope.PROJECT)),
         )
 
     def command_session(self) -> SessionInfo:
@@ -573,9 +659,7 @@ class KCodeApp(App[None]):
                 return
             if action.kind == "review" and action.item_id is not None:
                 proposal = next(
-                    item
-                    for item in self.memory_coordinator.pending()
-                    if item.id == action.item_id
+                    item for item in self.memory_coordinator.pending() if item.id == action.item_id
                 )
                 records = {record.id: record for record in self.memory_coordinator.records()}
                 targets = tuple(
@@ -649,9 +733,11 @@ class KCodeApp(App[None]):
                 selected,
                 tools=self.runner.tool_definitions(self.session.permission_mode),
             )
-            self.runner.bind_session(result.runtime)
+            skill_warnings = self.runner.bind_session(result.runtime)
             self.conversation = result.runtime.conversation
             await self._redraw_resumed_session(result)
+            for warning in skill_warnings:
+                await self._append_notice(warning, "system")
         except Exception as exc:
             await self._append_notice(f"恢复会话失败：{exc}", "error")
         finally:
@@ -688,13 +774,20 @@ class KCodeApp(App[None]):
         self._set_agent_status()
 
     @work(exclusive=True, group="generation")
-    async def generate_response(self, user_text: str, response: AssistantResponse) -> None:
+    async def generate_response(
+        self,
+        user_text: str,
+        response: AssistantResponse,
+        *,
+        event_source=None,
+    ) -> None:
         answer = ""
         thinking = ""
         last_refresh = 0.0
         current_response = response
         try:
-            async for event in self.runner.run(user_text, self.session):
+            events = event_source or self.runner.run(user_text, self.session)
+            async for event in events:
                 if isinstance(event, TextDelta):
                     answer += event.text
                 elif isinstance(event, ThinkingDelta):
@@ -784,7 +877,10 @@ class KCodeApp(App[None]):
 
     async def action_interrupt(self) -> None:
         if self.generating and self._generation_worker is not None:
-            self.runner.cancel()
+            if self.skill_executor.active_runner is not None:
+                self.skill_executor.cancel()
+            else:
+                self.runner.cancel()
             if isinstance(self.screen, ApprovalScreen):
                 self.screen.dismiss(None)
         else:

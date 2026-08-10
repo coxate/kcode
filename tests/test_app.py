@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from textual.widgets import Collapsible, Input, Markdown, Static
@@ -16,8 +17,10 @@ from kcode.events import (
 )
 from kcode.permissions.models import PermissionMode
 from kcode.session import AgentMode, AgentSession
+from kcode.skills.trust import SkillTrustStore
 from kcode.ui.app import KCodeApp
 from kcode.ui.approval import ApprovalScreen
+from kcode.ui.skill_trust import SkillTrustScreen
 from kcode.ui.widgets import AssistantResponse, ChatMessageWidget, ToolCallWidget
 
 
@@ -314,7 +317,7 @@ async def test_status_preserves_unknown_session_usage_fields() -> None:
         assert "会话 Token：输入 ? / 输出 3" in notice
 
 
-async def test_review_uses_the_normal_user_message_pipeline() -> None:
+async def test_review_uses_the_fork_skill_pipeline() -> None:
     provider = FakeProvider([TextDelta("reviewed"), StreamCompleted("stop")])
     conversation = Conversation()
     app = KCodeApp(provider, conversation)
@@ -323,8 +326,51 @@ async def test_review_uses_the_normal_user_message_pipeline() -> None:
         await pilot.pause(0.05)
 
     assert len(provider.requests) == 1
-    assert "额外关注点：并发安全" in conversation.snapshot()[0].user
+    assert "## Skill: review" in conversation.snapshot()[0].user
+    assert conversation.snapshot()[0].user.endswith("并发安全")
     assert conversation.snapshot()[0].assistant == "reviewed"
+
+
+async def test_default_skill_commands_and_prompt_are_registered_after_startup() -> None:
+    provider = FakeProvider([TextDelta("done"), StreamCompleted("stop")])
+    app = KCodeApp(provider)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.command_registry.frozen
+        assert len(app.command_registry.visible_commands()) == 16
+        assert [item.name for item in app.command_skills()] == ["commit", "review", "test"]
+        await submit(app, pilot, "/commit explain intent")
+        await pilot.pause(0.05)
+        user_widgets = [item for item in app.query(ChatMessageWidget) if item.role == "user"]
+        assert user_widgets[-1].text == "/commit explain intent"
+        stable = next(
+            item for item in provider.requests[0] if isinstance(item, StableSystemMessage)
+        )
+        assert "## Available Skills" in stable.content
+        assert "Review the current project." not in stable.content
+
+
+async def test_project_skill_trust_blocks_input_and_does_not_show_body(tmp_path: Path) -> None:
+    skill = tmp_path / ".kcode" / "skills" / "project-check" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    secret_body = "PRIVATE PROJECT SOP"
+    skill.write_text(
+        f"---\nname: project-check\ndescription: Project checks\n---\n{secret_body}\n",
+        encoding="utf-8",
+    )
+    store = SkillTrustStore(tmp_path / "trust" / "skills.json")
+    app = KCodeApp(FakeProvider(), cwd=tmp_path, skill_trust_store=store)
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, SkillTrustScreen)
+        assert app.query_one("#prompt", Input).disabled
+        summary = str(app.screen.query_one("#skill-trust-summary", Static).content)
+        assert "project-check" in summary
+        assert secret_body not in summary
+        await pilot.press("1")
+        await pilot.pause()
+        assert not app.query_one("#prompt", Input).disabled
+        assert app.command_registry.resolve("project-check") is not None
 
 
 async def test_openai_thinking_warning_is_shown_without_a_request() -> None:

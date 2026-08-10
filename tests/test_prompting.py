@@ -48,7 +48,7 @@ def test_default_sections_have_fixed_order_slots_and_key_rules() -> None:
     assert [section.priority for section in DEFAULT_PROMPT_SECTIONS] == list(range(1000, 0, -100))
     assert [section.name for section in DEFAULT_PROMPT_SECTIONS[-3:]] == [
         "custom_instructions",
-        "active_skills",
+        "available_skills",
         "long_term_memory",
     ]
     assert all(not section.content for section in DEFAULT_PROMPT_SECTIONS[-3:])

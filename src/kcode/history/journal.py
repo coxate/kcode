@@ -18,6 +18,7 @@ from kcode.history.models import (
     SessionEndRecord,
     SessionMetadata,
     SessionRecord,
+    SkillStateRecord,
 )
 
 
@@ -115,6 +116,21 @@ class SessionJournal:
             self.failure_reason = str(exc)
             return False
 
+    async def append_skill_state(self, names: tuple[str, ...]) -> bool:
+        if self.state == PersistenceState.CLOSED:
+            raise SessionJournalError("Cannot append to a closed session journal.")
+        if self.state == PersistenceState.DEGRADED:
+            return False
+        record = SkillStateRecord(type="skill_state", ts=time.time(), names=names)
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._executor, self._append_sync, (record,))
+            return True
+        except Exception as exc:
+            self.state = PersistenceState.DEGRADED
+            self.failure_reason = str(exc)
+            return False
+
     async def close(self, reason: str = "exit") -> bool:
         if self.state == PersistenceState.CLOSED:
             return self.failure_reason is None
@@ -188,9 +204,7 @@ class SessionJournal:
         try:
             if self._opened and self.failure_reason is None:
                 end = SessionEndRecord(type="session_end", ts=time.time(), reason=reason)
-                self._write_lines(
-                    (encode_record(end),)
-                )
+                self._write_lines((encode_record(end),))
         finally:
             self.lease.release()
 

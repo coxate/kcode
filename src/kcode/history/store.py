@@ -20,6 +20,7 @@ from kcode.history.models import (
     SessionMetadata,
     SessionRecord,
     SessionSummary,
+    SkillStateRecord,
 )
 from kcode.tools.base import ToolResult
 
@@ -84,6 +85,7 @@ class SessionStore:
         messages: list[ConversationMessage] = []
         last_active = header.created_at
         last_record_was_end = False
+        active_skill_names: tuple[str, ...] = ()
         for record in records[1:]:
             if isinstance(record, MessageRecord):
                 messages.append(decode_message(record.message))
@@ -92,6 +94,10 @@ class SessionStore:
             elif isinstance(record, SessionEndRecord):
                 last_active = max(last_active, record.ts)
                 last_record_was_end = True
+            elif isinstance(record, SkillStateRecord):
+                active_skill_names = record.names
+                last_active = max(last_active, record.ts)
+                last_record_was_end = False
 
         repaired, repair_warnings = self._repair_tool_chain(messages)
         conversation = Conversation()
@@ -115,6 +121,7 @@ class SessionStore:
             warnings=tuple(warnings),
             last_active_at=last_active,
             skipped_lines=skipped,
+            active_skill_names=active_skill_names,
         )
 
     def _read_summary(self, directory: Path) -> SessionSummary | None:
@@ -150,6 +157,8 @@ class SessionStore:
                 if not title and record.message.kind == "user":
                     title = " ".join(record.message.content.split())[:TITLE_LIMIT]
             elif isinstance(record, SessionEndRecord):
+                last_active = max(last_active, record.ts)
+            elif isinstance(record, SkillStateRecord):
                 last_active = max(last_active, record.ts)
         if message_count == 0:
             return None

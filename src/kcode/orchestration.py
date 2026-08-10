@@ -5,6 +5,7 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from kcode import __version__
 from kcode.config import AgentConfig
@@ -13,6 +14,7 @@ from kcode.conversation import (
     AssistantMessage,
     Conversation,
     ConversationMessage,
+    EnvironmentMessage,
     ProviderContinuationState,
     StableSystemMessage,
     ToolResultMessage,
@@ -58,6 +60,9 @@ from kcode.tools.base import ApprovalHandler, ToolCall, ToolContext, ToolEffect
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry
 from kcode.tools.scheduler import ToolScheduler
+
+if TYPE_CHECKING:
+    from kcode.skills.runtime import SkillRuntime
 
 PLAN_TOOL_NAMES = {"read_file", "find_files", "search_code", "run_command"}
 
@@ -155,22 +160,38 @@ class AgentRunner:
         self._cancel_event: asyncio.Event | None = None
         self._session_runtime: SessionRuntime | None = None
         self._memory_coordinator: MemoryCoordinator | None = None
+        self._skill_runtime: SkillRuntime | None = None
 
     def cancel(self) -> None:
         if self._cancel_event is not None:
             self._cancel_event.set()
 
-    def bind_session(self, runtime: SessionRuntime) -> None:
+    def bind_session(self, runtime: SessionRuntime) -> tuple[str, ...]:
         if self._cancel_event is not None:
             raise RuntimeError("Cannot switch sessions while the agent is running.")
         self._session_runtime = runtime
         self.conversation = runtime.conversation
         self.context_manager = runtime.context_manager
+        if self._skill_runtime is not None:
+            return self._skill_runtime.bind_session(runtime)
+        return ()
 
     def bind_memory(self, coordinator: MemoryCoordinator) -> None:
         if self._cancel_event is not None:
             raise RuntimeError("Cannot bind long-term memory while the agent is running.")
         self._memory_coordinator = coordinator
+
+    def bind_skills(self, runtime: SkillRuntime) -> tuple[str, ...]:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind Skills while the agent is running.")
+        self._skill_runtime = runtime
+        return runtime.bind_session(self._session_runtime)
+
+    def update_available_skills(self, content: str) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot update Skills while the agent is running.")
+        self.prompt_builder = self.prompt_builder.with_content("available_skills", content)
+        self._stable_system = StableSystemMessage(self.prompt_builder.build())
 
     def update_long_term_memory(self, content: str) -> None:
         if self._cancel_event is not None:
@@ -186,6 +207,40 @@ class AgentRunner:
 
     async def clear_context(self) -> None:
         await self.context_manager.clear()
+
+    async def commit_external_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        mode: PermissionMode,
+    ) -> tuple[str, ...]:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot commit an external turn while the agent is running.")
+        start = len(self.conversation.messages_snapshot())
+        handle = self.conversation.begin_turn(user_text)
+        self.conversation.complete_turn(handle, AssistantMessage(assistant_text))
+        warnings: list[str] = []
+        _, saved = await self._persist_since(self._session_runtime, start)
+        if not saved and self._session_runtime is not None:
+            warnings.append(self._persistence_warning(self._session_runtime))
+        if self._memory_coordinator is not None:
+            try:
+                session_id = (
+                    self._session_runtime.session_id
+                    if self._session_runtime is not None
+                    else "in-memory"
+                )
+                self._memory_coordinator.submit_turn(
+                    CompletedTurn.create(
+                        session_id,
+                        user_text,
+                        assistant_text,
+                        mode.value,
+                    )
+                )
+            except Exception as exc:
+                warnings.append(f"Long-term memory extraction was not queued: {exc}")
+        return tuple(warnings)
 
     async def compact_context(
         self,
@@ -333,9 +388,17 @@ class AgentRunner:
                 if resume_reminder is not None:
                     reminder_items.append(resume_reminder)
                 reminders = tuple(reminder_items)
+                active_content = (
+                    self._skill_runtime.active_prompt() if self._skill_runtime is not None else ""
+                )
+                dynamic_environment = environment
+                if active_content:
+                    dynamic_environment = EnvironmentMessage(
+                        f"{environment.content}\n\n{active_content}"
+                    )
                 prompt_package = PromptPackage(
                     self._stable_system,
-                    environment,
+                    dynamic_environment,
                     reminders,
                 )
                 canonical_messages = (*history, *current)
@@ -520,9 +583,7 @@ class AgentRunner:
                         yield ToolFinished(item.call, result)
                     checkpoint = tuple(batch_messages)
                     context_checkpoint = (
-                        checkpoint
-                        if assistant_checkpointed
-                        else (assistant, *checkpoint)
+                        checkpoint if assistant_checkpointed else (assistant, *checkpoint)
                     )
                     await self.context_manager.record_tool_results(context_checkpoint)
                     self.conversation.checkpoint_tool_step(handle, assistant, checkpoint)

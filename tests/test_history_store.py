@@ -91,6 +91,24 @@ async def test_load_complete_tool_chain_round_trips(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_load_uses_last_skill_state_without_counting_it_as_message(tmp_path) -> None:
+    session_id = create_session_id()
+    journal = SessionJournal(
+        tmp_path,
+        SessionMetadata(1, session_id, time.time(), "fake", "model"),
+    )
+    assert await journal.append_checkpoint((UserMessage("x"), AssistantMessage("y")))
+    assert await journal.append_skill_state(("one",))
+    assert await journal.append_skill_state(("one", "two"))
+    await journal.close()
+    loaded = SessionStore(tmp_path).load(session_id)
+    assert loaded.active_skill_names == ("one", "two")
+    assert len(loaded.messages) == 2
+    summary = next(item for item in SessionStore(tmp_path).list_sessions())
+    assert summary.message_count == 2
+
+
+@pytest.mark.asyncio
 async def test_invalid_utf8_message_line_is_skipped_without_losing_other_records(tmp_path) -> None:
     journal = await make_session(tmp_path, (UserMessage("x"), AssistantMessage("y")))
     lines = journal.path.read_bytes().splitlines(keepends=True)

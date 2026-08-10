@@ -22,7 +22,7 @@ from kcode.history.codec import (
     encode_record,
 )
 from kcode.history.ids import create_session_id, session_path, validate_session_id
-from kcode.history.models import MessageRecord, SessionRecord
+from kcode.history.models import MessageRecord, SessionRecord, SkillStateRecord
 from kcode.tools.base import ToolCall, ToolResult
 
 
@@ -89,15 +89,18 @@ def test_record_schema_is_versioned_strict_and_jsonl_safe() -> None:
     )
     assert decode_record(encode_record(header)) == header
 
-    line = json.dumps(
-        {"type": "message", "ts": 2, "message": {"kind": "user", "content": "x"}}
-    )
+    line = json.dumps({"type": "message", "ts": 2, "message": {"kind": "user", "content": "x"}})
     assert isinstance(decode_record(line), MessageRecord)
 
     with pytest.raises(HistoryCodecError):
         decode_record('{"type":"session","schema":2}')
     with pytest.raises(HistoryCodecError):
         decode_record(
-            '{"type":"message","ts":1,"message":{"kind":"user","content":"x",'
-            '"unknown":true}}'
+            '{"type":"message","ts":1,"message":{"kind":"user","content":"x","unknown":true}}'
         )
+
+
+def test_skill_state_record_round_trip_keeps_names_ordered() -> None:
+    record = SkillStateRecord(type="skill_state", ts=3.0, names=("review", "test"))
+    assert decode_record(encode_record(record)) == record
+    assert '"names":["review","test"]' in encode_record(record)

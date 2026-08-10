@@ -30,7 +30,7 @@ async def test_menu_filters_canonical_names_and_alias_selects_default() -> None:
 
         menu = app.query_one("#command-menu", CommandMenu)
         assert menu.display
-        assert [command.name for command in menu.commands] == ["session", "status"]
+        assert [command.name for command in menu.commands] == ["session", "skill", "status"]
         assert menu.selected_name() == "status"
         assert app.focused is prompt
 
@@ -96,5 +96,5 @@ async def test_enter_executes_highlighted_command_and_menu_has_six_line_cap(
 
         prompt.value = "/"
         await pilot.pause()
-        assert menu.option_count == 13
+        assert menu.option_count == 16
         assert menu.size.height <= 6

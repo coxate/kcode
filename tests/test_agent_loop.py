@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from kcode.config import AgentConfig
 from kcode.conversation import (
@@ -29,6 +30,10 @@ from kcode.permissions import (
     empty_permission_settings,
 )
 from kcode.session import AgentMode, AgentSession
+from kcode.skills.catalog import SkillCatalog
+from kcode.skills.models import SkillDefinition, SkillMeta, SkillSource
+from kcode.skills.runtime import SkillRuntime
+from kcode.skills.tools import LoadSkillTool
 from kcode.tools.base import ToolContext
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import create_default_registry
@@ -84,6 +89,60 @@ def make_runner(tmp_path, provider, *, config=None, conversation=None, environme
         config,
         environment_collector=environment_collector or FakeEnvironmentCollector(),
     )
+
+
+async def test_load_skill_is_visible_in_plan_and_updates_next_iteration_environment(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            [
+                ToolCallDelta(0, "skill-1", "load_skill", '{"name":"review"}'),
+                StreamCompleted("tool_calls"),
+            ],
+            [TextDelta("followed sop"), StreamCompleted("stop")],
+        ]
+    )
+    path = Path("/tmp/review/SKILL.md")
+    runtime = SkillRuntime(
+        SkillCatalog(
+            (
+                SkillDefinition(
+                    SkillMeta(name="review", description="Review code"),
+                    "ACTIVE REVIEW SOP",
+                    SkillSource.BUILTIN,
+                    path,
+                    path.parent.parent,
+                    "digest",
+                ),
+            )
+        )
+    )
+    registry = create_default_registry()
+    registry.register(LoadSkillTool(runtime))
+    settings = empty_permission_settings(tmp_path)
+    runner = AgentRunner(
+        provider,
+        Conversation(),
+        registry,
+        ToolExecutor(
+            registry,
+            PermissionEngine(settings),
+            LocalPermissionStore(settings.layers[0].path),
+        ),
+        ToolContext(tmp_path),
+        allow,
+        environment_collector=FakeEnvironmentCollector(),
+    )
+    runner.bind_skills(runtime)
+    events = [event async for event in runner.run("review this", AgentSession(AgentMode.PLAN))]
+    assert any(isinstance(item, AgentStopped) for item in events)
+    plan_tools = {item.name for item in provider.requests[0][1]}
+    assert "load_skill" in plan_tools
+    second_environment = next(
+        item for item in provider.requests[1][0] if isinstance(item, EnvironmentMessage)
+    )
+    assert "ACTIVE REVIEW SOP" in second_environment.content
 
 
 async def test_agent_loops_three_tools_then_completes(tmp_path) -> None:

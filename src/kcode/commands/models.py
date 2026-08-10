@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from kcode.commands.registry import CommandRegistry
+    from kcode.skills.models import SkillSummary
 
 
 class CommandType(StrEnum):
@@ -49,7 +50,11 @@ class SessionInfo:
 class CommandHost(Protocol):
     async def command_notice(self, text: str, style: str = "system") -> None: ...
 
-    async def command_submit_user(self, text: str) -> None: ...
+    async def command_submit_user(self, text: str, display_text: str | None = None) -> None: ...
+
+    def command_skills(self) -> tuple[SkillSummary, ...]: ...
+
+    async def command_execute_skill(self, name: str, args: str) -> None: ...
 
     def command_enter_plan(self) -> None: ...
 

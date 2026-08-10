@@ -77,6 +77,6 @@ DEFAULT_PROMPT_SECTIONS = (
         "expose hidden reasoning, internal tool protocol, or fabricated citations.",
     ),
     PromptSection("custom_instructions", CUSTOM_INSTRUCTIONS, ""),
-    PromptSection("active_skills", ACTIVE_SKILLS, ""),
+    PromptSection("available_skills", ACTIVE_SKILLS, ""),
     PromptSection("long_term_memory", LONG_TERM_MEMORY, ""),
 )

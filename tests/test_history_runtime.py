@@ -68,6 +68,22 @@ async def test_runtime_shares_id_clear_preserves_old_and_creates_fresh(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_runtime_skill_names_are_saved_resumed_and_cleared(tmp_path) -> None:
+    original = SessionCoordinator(tmp_path, FakeProvider())
+    target_id = original.current.session_id
+    assert await original.current.record_skill_state(("review", "test"))
+    assert original.current.active_skill_names == ("review", "test")
+    await original.close()
+
+    current = SessionCoordinator(tmp_path, FakeProvider())
+    resumed = await current.resume(target_id)
+    assert resumed.runtime.active_skill_names == ("review", "test")
+    fresh, _ = await current.clear()
+    assert fresh.active_skill_names == ()
+    await current.close()
+
+
+@pytest.mark.asyncio
 async def test_resume_prepares_candidate_then_switches_and_warns_on_model_change(tmp_path) -> None:
     original = SessionCoordinator(tmp_path, FakeProvider("old-model"))
     target_id = original.current.session_id

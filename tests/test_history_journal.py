@@ -72,7 +72,7 @@ async def test_journal_lock_blocks_second_writer_and_releases_on_close(tmp_path)
 async def test_journal_redacts_known_values_and_degrades_after_fsync_failure(
     tmp_path, monkeypatch
 ) -> None:
-    secret = "key-\"secret\""
+    secret = 'key-"secret"'
     journal = SessionJournal(tmp_path, metadata(), sensitive_values=(secret,))
     assert await journal.append_checkpoint((UserMessage(secret), AssistantMessage("ok")))
     assert secret not in journal.path.read_text(encoding="utf-8")
@@ -107,6 +107,16 @@ async def test_concurrent_checkpoint_submissions_remain_ordered(tmp_path) -> Non
     await journal.close()
     text = journal.path.read_text(encoding="utf-8")
     assert text.index('"content":"one"') < text.index('"content":"two"')
+
+
+@pytest.mark.asyncio
+async def test_skill_state_is_appended_without_skill_body(tmp_path) -> None:
+    journal = SessionJournal(tmp_path, metadata())
+    assert await journal.append_skill_state(("review", "test"))
+    text = journal.path.read_text(encoding="utf-8")
+    assert '"type":"skill_state"' in text
+    assert '"names":["review","test"]' in text
+    await journal.close()
 
 
 def test_lease_rejects_symlink_lock(tmp_path) -> None:

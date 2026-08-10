@@ -30,7 +30,7 @@ def main() -> int:
         permission_paths = default_permission_paths(Path.cwd())
         permission_settings = PermissionConfigLoader().load(*permission_paths)
         provider, warnings = create_provider(config.active)
-        command_registry = create_builtin_registry()
+        command_registry = create_builtin_registry(freeze=False)
     except ConfigError as exc:
         print(f"KCode configuration error: {exc}", file=sys.stderr)
         return 2

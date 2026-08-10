@@ -15,7 +15,9 @@ from kcode.commands import (
     SessionInfo,
     StatusSnapshot,
     create_builtin_registry,
+    register_skill_commands,
 )
+from kcode.skills.models import SkillSummary
 
 
 @dataclass
@@ -24,12 +26,19 @@ class FakeHost:
     submitted: list[str] = field(default_factory=list)
     mode: str = "default"
     compact_focus: str | None = None
+    executed_skills: list[tuple[str, str]] = field(default_factory=list)
 
     async def command_notice(self, text: str, style: str = "system") -> None:
         self.notices.append((text, style))
 
-    async def command_submit_user(self, text: str) -> None:
+    async def command_submit_user(self, text: str, display_text: str | None = None) -> None:
         self.submitted.append(text)
+
+    def command_skills(self) -> tuple[SkillSummary, ...]:
+        return (SkillSummary("review", "Review code"),)
+
+    async def command_execute_skill(self, name: str, args: str) -> None:
+        self.executed_skills.append((name, args))
 
     def command_enter_plan(self) -> None:
         self.mode = "plan"
@@ -86,6 +95,7 @@ def test_builtin_commands_aliases_and_candidates() -> None:
     assert registry.resolve("S").name == "status"
     assert [command.name for command in registry.candidates("s")] == [
         "session",
+        "skill",
         "status",
     ]
 
@@ -133,7 +143,7 @@ def test_registration_rejects_name_alias_and_case_conflicts() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_unknown_usage_plan_review_and_compact() -> None:
+async def test_dispatch_unknown_usage_plan_skill_and_compact() -> None:
     registry = create_builtin_registry()
     dispatcher = CommandDispatcher(registry)
     host = FakeHost()
@@ -146,8 +156,8 @@ async def test_dispatch_unknown_usage_plan_review_and_compact() -> None:
     await dispatcher.dispatch("/plan 设计  注册器", host)
     assert host.mode == "plan"
     assert host.submitted[-1] == "设计  注册器"
-    await dispatcher.dispatch("/review 并发安全", host)
-    assert "额外关注点：并发安全" in host.submitted[-1]
+    await dispatcher.dispatch("/skill", host)
+    assert "/review — Review code" in host.notices[-1][0]
     await dispatcher.dispatch("/compact 只保留 API", host)
     assert host.compact_focus == "只保留 API"
 
@@ -193,3 +203,24 @@ async def test_argument_limit_and_handler_errors_become_notices() -> None:
     assert "2000" in host.notices[-1][0]
     await dispatcher.dispatch("/broken", host)
     assert host.notices[-1][0] == "命令 /broken 执行失败：RuntimeError。"
+
+
+@pytest.mark.asyncio
+async def test_delayed_freeze_registers_dynamic_skills() -> None:
+    registry = create_builtin_registry(freeze=False)
+    assert not registry.frozen
+    register_skill_commands(
+        registry,
+        (
+            SkillSummary("commit", "Commit changes"),
+            SkillSummary("review", "Review code"),
+            SkillSummary("test", "Run tests"),
+        ),
+    )
+    registry.freeze()
+    registry.freeze()
+    assert registry.frozen
+    assert len(registry.visible_commands()) == 16
+    host = FakeHost()
+    assert await CommandDispatcher(registry).dispatch("/review 并发 安全", host)
+    assert host.executed_skills == [("review", "并发 安全")]
