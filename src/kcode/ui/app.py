@@ -23,7 +23,7 @@ from kcode.commands import (
     create_builtin_registry,
     register_skill_commands,
 )
-from kcode.config import AgentConfig
+from kcode.config import AgentConfig, ProviderConfig, SubAgentConfig
 from kcode.conversation import AssistantMessage, Conversation, ToolResultMessage, UserMessage
 from kcode.events import (
     AgentPhase,
@@ -72,9 +72,21 @@ from kcode.skills import (
     SkillTrustStore,
 )
 from kcode.skills.executor import SkillInvocation
+from kcode.subagents import (
+    AgentCatalog,
+    AgentCatalogBuilder,
+    AgentTrustStore,
+    ProviderPool,
+    SubAgentFactory,
+    SubAgentService,
+    TaskManager,
+    register_subagent_tools,
+)
+from kcode.subagents.approval import ApprovalBroker
 from kcode.tools.base import ApprovalRequest, ToolContext
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry, create_default_registry
+from kcode.ui.agent_trust import AgentTrustScreen
 from kcode.ui.approval import ApprovalScreen
 from kcode.ui.command_menu import CommandMenu
 from kcode.ui.hook_trust import HookTrustScreen
@@ -135,7 +147,7 @@ class KCodeApp(App[None]):
         Binding("up", "command_menu_up", "Previous command", show=False, priority=True),
         Binding("down", "command_menu_down", "Next command", show=False, priority=True),
         Binding("tab", "command_menu_complete", "Complete command", show=False, priority=True),
-        Binding("escape", "command_menu_close", "Close commands", show=False, priority=True),
+        Binding("escape", "escape", "Close / Background", show=False, priority=True),
     ]
 
     def __init__(
@@ -161,6 +173,10 @@ class KCodeApp(App[None]):
         hook_builder: HookCatalogBuilder | None = None,
         hook_trust_store: HookTrustStore | None = None,
         hook_engine: HookEngine | None = None,
+        provider_configs: dict[str, ProviderConfig] | None = None,
+        subagent_config: SubAgentConfig | None = None,
+        agent_builder: AgentCatalogBuilder | None = None,
+        agent_trust_store: AgentTrustStore | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -190,10 +206,12 @@ class KCodeApp(App[None]):
         self.hook_builder = hook_builder or HookCatalogBuilder(self.cwd)
         self.hook_trust_store = hook_trust_store or HookTrustStore()
         self.hook_engine = hook_engine or HookEngine()
+        self.agent_builder = agent_builder or AgentCatalogBuilder(self.cwd)
+        self.agent_trust_store = agent_trust_store or AgentTrustStore()
+        self.subagent_config = subagent_config or SubAgentConfig()
         self.skill_runtime = SkillRuntime()
         if self.registry.get("load_skill") is None:
             self.registry.register(LoadSkillTool(self.skill_runtime))
-        self.skill_executor = SkillExecutor(self.skill_runtime)
         self.permission_engine = PermissionEngine(permission_settings)
         self.session = session or AgentSession(
             permission_settings.initial_mode,
@@ -221,6 +239,32 @@ class KCodeApp(App[None]):
             self.hook_engine,
             coordinator.current if coordinator is not None else None,
         )
+        configs = provider_configs or {}
+        provider_config = getattr(provider, "config", None)
+        if isinstance(provider_config, ProviderConfig):
+            configs = {**configs, provider_config.name: provider_config}
+        self.provider_pool = ProviderPool(provider, configs)
+        self.subagent_factory = SubAgentFactory(self.provider_pool)
+        self.approval_broker = ApprovalBroker(self._request_approval)
+        self._subagent_notices: list[str] = []
+        self.task_manager = TaskManager(
+            self.subagent_config,
+            self.approval_broker,
+            sensitive_values=self.context.sensitive_values,
+            usage_callback=self._record_subagent_usage,
+            notice_callback=self._subagent_notices.append,
+        )
+        self.subagent_service = SubAgentService(
+            AgentCatalog(),
+            self.subagent_factory,
+            self.task_manager,
+            self.runner,
+            self.subagent_config,
+        )
+        register_subagent_tools(self.registry, self.subagent_service)
+        self.runner.bind_task_notifications(self.task_manager)
+        self.hook_engine.bind_agent_launcher(self.subagent_service)
+        self.skill_executor = SkillExecutor(self.skill_runtime, self.subagent_factory)
         self.hook_engine.update_sensitive_values(self.context.sensitive_values)
         self.generating = False
         self._generation_worker: Worker[None] | None = None
@@ -228,6 +272,8 @@ class KCodeApp(App[None]):
         self._tool_widgets: dict[str, ToolCallWidget] = {}
         self._iteration = 0
         self._usage = TokenUsage()
+        self._main_request_usage = TokenUsage()
+        self._subagent_request_usage = TokenUsage(0, 0, 0, 0, 0)
         self._session_usage = TokenUsage(0, 0, 0, 0, 0)
         self._coordinator_closed = False
         self._memory_closed = False
@@ -260,13 +306,16 @@ class KCodeApp(App[None]):
     async def on_mount(self) -> None:
         for warning in self.startup_warnings:
             await self._append_notice(warning, "system")
-        self.query_one("#ready", Label).update("正在检查 Skills 与 MCP Server…")
+        self.query_one("#ready", Label).update("正在检查 Skills、Hooks、Agents 与 MCP Server…")
         self.initialize_mcp()
         if self.memory_coordinator is not None:
             self.monitor_memory()
         self.monitor_hook_warnings()
+        self.monitor_subagents()
+        self.monitor_subagent_approvals()
 
     async def on_unmount(self) -> None:
+        await self.task_manager.close()
         await self._close_hooks("exit", display=False)
         if self.coordinator is not None and not self._coordinator_closed:
             warnings = await asyncio.shield(self.coordinator.close())
@@ -369,6 +418,9 @@ class KCodeApp(App[None]):
     async def _request_skill_trust(self, request) -> bool:
         return await self.push_screen_wait(SkillTrustScreen(request))
 
+    async def _request_agent_trust(self, request) -> bool:
+        return await self.push_screen_wait(AgentTrustScreen(request))
+
     async def _connect_mcp_tools(self) -> str:
         if self.mcp_manager is None:
             return "Ready. Ask me anything."
@@ -379,11 +431,11 @@ class KCodeApp(App[None]):
             raise
         except Exception as exc:
             await self._append_notice(
-                "MCP initialization failed; Skills and Hooks remain available: "
+                "MCP initialization failed; Skills, Hooks, and Agents remain available: "
                 f"{exc.__class__.__name__}.",
                 "error",
             )
-            return "Ready. MCP initialization failed; Skills/Hooks are available."
+            return "Ready. MCP initialization failed; Skills/Hooks/Agents are available."
         for tool in summary.tools:
             try:
                 self.registry.register(tool)
@@ -396,6 +448,7 @@ class KCodeApp(App[None]):
             ),
         )
         self.runner.update_tool_context(self.context)
+        self.task_manager.sensitive_values = self.context.sensitive_values
         if self.coordinator is not None:
             self.coordinator.update_sensitive_values(self.context.sensitive_values)
         if self.memory_coordinator is not None:
@@ -409,6 +462,7 @@ class KCodeApp(App[None]):
         prompt = self.query_one("#prompt", Input)
         project_trusted = False
         project_hooks_trusted = False
+        project_agents_trusted = False
         try:
             request, trust_warnings = self.skill_builder.trust_request()
             for warning in trust_warnings:
@@ -445,6 +499,28 @@ class KCodeApp(App[None]):
                                 "无法安全保存项目 Hook 信任；已跳过项目 Hooks。",
                                 "error",
                             )
+            if self.subagent_config.enabled:
+                agent_request, agent_trust_warnings = self.agent_builder.trust_request()
+            else:
+                agent_request, agent_trust_warnings = None, ()
+            for warning in agent_trust_warnings:
+                await self._append_notice(warning, "system")
+            if agent_request is not None:
+                project_agents_trusted = self.agent_trust_store.is_trusted(agent_request)
+                if not project_agents_trusted:
+                    project_agents_trusted = await self._request_agent_trust(agent_request)
+                    if project_agents_trusted:
+                        try:
+                            await asyncio.to_thread(
+                                self.agent_trust_store.trust,
+                                agent_request,
+                            )
+                        except (OSError, ValueError):
+                            project_agents_trusted = False
+                            await self._append_notice(
+                                "无法安全保存项目 Agent 信任；已跳过项目 Agents。",
+                                "error",
+                            )
             ready_message = await self._connect_mcp_tools()
             catalog = self.skill_builder.build(
                 project_trusted=project_trusted,
@@ -453,6 +529,17 @@ class KCodeApp(App[None]):
             )
             self.skill_runtime.set_catalog(catalog)
             self.runner.update_available_skills(catalog.available_prompt())
+            agent_catalog = (
+                self.agent_builder.build(
+                    project_trusted=project_agents_trusted,
+                    tool_names=self.registry.names(),
+                    provider_names=self.provider_pool.names,
+                )
+                if self.subagent_config.enabled
+                else AgentCatalog()
+            )
+            self.subagent_service.set_catalog(agent_catalog)
+            self.runner.update_available_agents(agent_catalog.available_prompt())
             hook_catalog = self.hook_builder.build(project_trusted=project_hooks_trusted)
             self.hook_engine.set_catalog(hook_catalog)
             register_skill_commands(self.command_registry, catalog.summaries())
@@ -461,6 +548,8 @@ class KCodeApp(App[None]):
                 await self._append_notice(warning, "system")
             for warning in hook_catalog.warnings:
                 await self._append_notice(warning.render(), "system")
+            for warning in agent_catalog.warnings:
+                await self._append_notice(warning, "system")
             await self._dispatch_app_hook(HookEvent.STARTUP, message="ready")
             await self._start_hook_session("initial")
             self.query_one("#ready", Label).update(ready_message)
@@ -475,7 +564,9 @@ class KCodeApp(App[None]):
             )
             if not self.command_registry.frozen:
                 self.command_registry.freeze()
-            self.query_one("#ready", Label).update("Ready. Skill/MCP initialization failed.")
+            self.query_one("#ready", Label).update(
+                "Ready. Skill/Hook/Agent/MCP initialization failed."
+            )
         finally:
             prompt.disabled = False
             prompt.focus()
@@ -489,7 +580,13 @@ class KCodeApp(App[None]):
         total = self._usage.total_tokens
         tokens = f" · Token {total}" if total is not None else " · Token ?"
         suffix = f" · {phase}" if phase else ""
-        return f"Agent{iteration}{tokens}{suffix}"
+        tasks = ""
+        if self.task_manager.running_count or self.task_manager.waiting_approval_count:
+            tasks = (
+                f" · 子任务 {self.task_manager.running_count}"
+                f"/授权 {self.task_manager.waiting_approval_count}"
+            )
+        return f"Agent{iteration}{tokens}{tasks}{suffix}"
 
     def _permission_status_text(self) -> str:
         return f"Permissions: {self.session.permission_mode.value}"
@@ -505,7 +602,8 @@ class KCodeApp(App[None]):
         try:
             choice = await self.push_screen_wait(ApprovalScreen(request))
             if choice is None:
-                self.runner.cancel()
+                if request.task_id is None:
+                    self.runner.cancel()
                 return ApprovalChoice.DENY
             return choice
         finally:
@@ -564,9 +662,26 @@ class KCodeApp(App[None]):
     def action_command_menu_close(self) -> None:
         self.query_one("#command-menu", CommandMenu).close()
 
+    async def action_escape(self) -> None:
+        if len(self.screen_stack) > 1:
+            self.screen.dismiss(None)
+            return
+        menu = self.query_one("#command-menu", CommandMenu)
+        if menu.display:
+            menu.close()
+            return
+        if self.task_manager.detach_foreground():
+            await self._append_notice(
+                "前台 SubAgent 已转到后台；完成后会通知主 Agent。",
+                "system",
+            )
+            self._set_agent_status()
+
     async def _submit_user_text(self, text: str, display_text: str | None = None) -> None:
         self._iteration = 0
         self._usage = TokenUsage()
+        self._main_request_usage = TokenUsage()
+        self._subagent_request_usage = TokenUsage(0, 0, 0, 0, 0)
         self._set_agent_status()
         await self.query_one("#chat", VerticalScroll).mount(
             ChatMessageWidget("user", display_text or text)
@@ -624,6 +739,8 @@ class KCodeApp(App[None]):
     async def _submit_fork(self, invocation: SkillInvocation) -> None:
         self._iteration = 0
         self._usage = TokenUsage()
+        self._main_request_usage = TokenUsage()
+        self._subagent_request_usage = TokenUsage(0, 0, 0, 0, 0)
         self._set_agent_status()
         await self.query_one("#chat", VerticalScroll).mount(
             ChatMessageWidget("user", invocation.display_text)
@@ -684,6 +801,8 @@ class KCodeApp(App[None]):
         self.session.clear()
         self._iteration = 0
         self._usage = TokenUsage()
+        self._main_request_usage = TokenUsage()
+        self._subagent_request_usage = TokenUsage(0, 0, 0, 0, 0)
         self._session_usage = TokenUsage(0, 0, 0, 0, 0)
         await self._start_hook_session("clear")
         await self.query_one("#chat", VerticalScroll).remove_children()
@@ -699,6 +818,7 @@ class KCodeApp(App[None]):
         self._resume_session()
 
     async def command_exit(self) -> None:
+        await self.task_manager.close()
         await self._close_hooks("exit", display=True)
         if self.coordinator is not None and not self._coordinator_closed:
             for warning in await self.coordinator.close():
@@ -767,6 +887,44 @@ class KCodeApp(App[None]):
         prompt.disabled = value
         if not value:
             prompt.focus()
+
+    def _record_subagent_usage(self, usage: TokenUsage) -> None:
+        """Count child usage in the session UI, not in the main context anchor."""
+        self._subagent_request_usage = self._subagent_request_usage.plus(usage)
+        self._usage = self._main_request_usage.plus(self._subagent_request_usage)
+        self._session_usage = self._session_usage.plus(usage)
+        if self.is_mounted:
+            self._set_agent_status()
+
+    @work(exclusive=True, group="subagent-monitor")
+    async def monitor_subagents(self) -> None:
+        while not self.task_manager.closed:
+            await asyncio.sleep(0.1)
+            notices = tuple(self._subagent_notices)
+            self._subagent_notices.clear()
+            for notice in notices:
+                await self._append_notice(notice, "system")
+            if notices:
+                self._set_agent_status()
+
+    @work(exclusive=True, group="subagent-approval-monitor")
+    async def monitor_subagent_approvals(self) -> None:
+        while not self.task_manager.closed:
+            ticket = await self.approval_broker.next_ticket()
+            while (
+                self.generating
+                and not self.task_manager.closed
+                and self.approval_broker.is_pending(ticket.id)
+            ):
+                await asyncio.sleep(0.1)
+            if not self.approval_broker.is_pending(ticket.id):
+                continue
+            if self.task_manager.closed:
+                self.approval_broker.resolve(ticket.id, ApprovalChoice.DENY)
+                return
+            choice = await self.push_screen_wait(ApprovalScreen(ticket.request))
+            self.approval_broker.resolve(ticket.id, choice or ApprovalChoice.DENY)
+            self._set_agent_status()
 
     @work(exclusive=True, group="memory-monitor")
     async def monitor_memory(self) -> None:
@@ -940,6 +1098,8 @@ class KCodeApp(App[None]):
             await self._append_notice(warning, "system")
         self._iteration = 0
         self._usage = TokenUsage()
+        self._main_request_usage = TokenUsage()
+        self._subagent_request_usage = TokenUsage(0, 0, 0, 0, 0)
         self._session_usage = TokenUsage(0, 0, 0, 0, 0)
         self._set_agent_status()
 
@@ -982,7 +1142,8 @@ class KCodeApp(App[None]):
                             answer = ""
                             thinking = ""
                 elif isinstance(event, TokenUsageUpdated):
-                    self._usage = event.cumulative
+                    self._main_request_usage = event.cumulative
+                    self._usage = event.cumulative.plus(self._subagent_request_usage)
                     self._session_usage = self._session_usage.plus(event.request)
                     self._set_agent_status()
                 elif isinstance(event, ToolCallReady):

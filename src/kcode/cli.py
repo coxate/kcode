@@ -19,6 +19,7 @@ from kcode.permissions import (
 )
 from kcode.prompting import DEFAULT_PROMPT_SECTIONS, SystemPromptBuilder
 from kcode.providers.factory import create_provider
+from kcode.subagents import AgentCatalogBuilder, AgentTrustStore
 from kcode.tools.base import ToolContext
 from kcode.tools.registry import create_default_registry
 from kcode.ui.app import KCodeApp
@@ -100,6 +101,7 @@ def main() -> int:
             *warnings,
             *permission_settings.warnings,
             *config.mcp_warnings,
+            *config.subagent_warnings,
             *instruction_warnings,
             *memory_warnings,
         ),
@@ -117,6 +119,10 @@ def main() -> int:
         hook_builder=HookCatalogBuilder(cwd),
         hook_trust_store=HookTrustStore(),
         hook_engine=HookEngine(),
+        provider_configs=config.providers,
+        subagent_config=config.subagents,
+        agent_builder=AgentCatalogBuilder(cwd),
+        agent_trust_store=AgentTrustStore(),
     )
     app.run()
     return 0

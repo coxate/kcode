@@ -122,4 +122,4 @@ async def test_mcp_failure_does_not_skip_hook_finalization(tmp_path: Path) -> No
         assert not app.query_one("#prompt", Input).disabled
         assert app.command_registry.frozen
         assert [item.id for item in app.command_hooks()] == ["mcp-fallback"]
-        assert "Skills/Hooks are available" in str(app.query_one("#ready", Static).content)
+        assert "Skills/Hooks/Agents are available" in str(app.query_one("#ready", Static).content)

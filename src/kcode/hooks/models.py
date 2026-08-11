@@ -7,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Protocol, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from kcode.permissions.models import PermissionMode
 from kcode.tools.base import JSONValue
@@ -94,8 +94,25 @@ class HttpAction(_ActionModel):
     timeout: float = Field(default=30.0, ge=0.1, le=300.0, strict=True)
 
 
+class AgentAction(_ActionModel):
+    type: Literal["agent"]
+    prompt: str = Field(min_length=1, max_length=32 * 1024)
+    subagent_type: str = Field(
+        pattern=r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+        max_length=64,
+    )
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("name")
+    @classmethod
+    def name_is_single_line(cls, value: str | None) -> str | None:
+        if value is not None and (value != value.strip() or "\n" in value or "\r" in value):
+            raise ValueError("name must be a trimmed single line")
+        return value
+
+
 HookAction: TypeAlias = Annotated[
-    CommandAction | PromptAction | HttpAction,
+    CommandAction | PromptAction | HttpAction | AgentAction,
     Field(discriminator="type"),
 ]
 
@@ -105,7 +122,7 @@ class Hook:
     id: str
     event: HookEvent
     condition: ConditionGroup | None
-    action: CommandAction | PromptAction | HttpAction | None
+    action: CommandAction | PromptAction | HttpAction | AgentAction | None
     reject: bool
     reason: str | None
     once: bool
@@ -129,6 +146,7 @@ class HookContext:
     command: str = ""
     tool_status: str = ""
     iteration: int = 0
+    is_subagent: bool = False
 
     def field_value(self, path: str) -> str:
         values = {

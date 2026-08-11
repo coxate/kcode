@@ -5,7 +5,7 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from kcode import __version__
 from kcode.config import AgentConfig
@@ -17,6 +17,7 @@ from kcode.conversation import (
     EnvironmentMessage,
     ProviderContinuationState,
     StableSystemMessage,
+    SystemReminderMessage,
     ToolResultMessage,
     UserMessage,
 )
@@ -89,6 +90,17 @@ class ModelResponse:
     usage: TokenUsage | None
 
 
+@dataclass(frozen=True, slots=True)
+class DelegationSnapshot:
+    request_messages: tuple[ConversationMessage, ...]
+    tools: tuple
+    mode: PermissionMode
+
+
+class TaskNotificationSource(Protocol):
+    def take_notifications(self) -> tuple[str, ...]: ...
+
+
 class StreamAccumulator:
     def __init__(self) -> None:
         self.text = ""
@@ -145,6 +157,8 @@ class AgentRunner:
         prompt_builder: SystemPromptBuilder | None = None,
         environment_collector: EnvironmentCollector | None = None,
         context_manager: ContextManager | None = None,
+        request_seed: Sequence[ConversationMessage] = (),
+        is_subagent: bool = False,
     ) -> None:
         self.provider = provider
         self.conversation = conversation
@@ -155,6 +169,8 @@ class AgentRunner:
         self.config = config or AgentConfig()
         self.scheduler = scheduler or ToolScheduler(executor, self.config.max_parallel_tools)
         self.prompt_builder = prompt_builder or SystemPromptBuilder(DEFAULT_PROMPT_SECTIONS)
+        self._available_skills_content = self.prompt_builder.content("available_skills")
+        self._available_agents_content = ""
         self.environment_collector = environment_collector or EnvironmentCollector()
         self._stable_system = StableSystemMessage(self.prompt_builder.build())
         provider_config = getattr(provider, "config", None)
@@ -171,6 +187,10 @@ class AgentRunner:
         self._skill_runtime: SkillRuntime | None = None
         self._hook_engine: HookEngine | None = None
         self._hook_session: HookSession | None = None
+        self._request_seed = tuple(request_seed)
+        self._delegation_snapshot: DelegationSnapshot | None = None
+        self._task_notifications: TaskNotificationSource | None = None
+        self.is_subagent = is_subagent
 
     def cancel(self) -> None:
         if self._cancel_event is not None:
@@ -216,11 +236,42 @@ class AgentRunner:
     def hook_session(self) -> HookSession | None:
         return self._hook_session
 
+    @property
+    def skill_runtime(self) -> SkillRuntime | None:
+        return self._skill_runtime
+
+    @property
+    def delegation_snapshot(self) -> DelegationSnapshot | None:
+        return self._delegation_snapshot
+
+    def bind_task_notifications(self, source: TaskNotificationSource) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind task notifications while the agent is running.")
+        self._task_notifications = source
+
     def update_available_skills(self, content: str) -> None:
         if self._cancel_event is not None:
             raise RuntimeError("Cannot update Skills while the agent is running.")
+        self._available_skills_content = content
+        self._update_capabilities_prompt()
+
+    def _update_capabilities_prompt(self) -> None:
+        content = "\n\n".join(
+            item
+            for item in (
+                self._available_skills_content.strip(),
+                self._available_agents_content.strip(),
+            )
+            if item
+        )
         self.prompt_builder = self.prompt_builder.with_content("available_skills", content)
         self._stable_system = StableSystemMessage(self.prompt_builder.build())
+
+    def update_available_agents(self, content: str) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot update Agents while the agent is running.")
+        self._available_agents_content = content
+        self._update_capabilities_prompt()
 
     def update_long_term_memory(self, content: str) -> None:
         if self._cancel_event is not None:
@@ -348,6 +399,7 @@ class AgentRunner:
             command,
             tool_status,
             iteration,
+            self.is_subagent,
         )
 
     async def _run_hooks(
@@ -505,6 +557,11 @@ class AgentRunner:
                     reminder_items.extend(
                         self._hook_engine.runtime.take_prompts(self._hook_session)
                     )
+                if self._task_notifications is not None:
+                    reminder_items.extend(
+                        SystemReminderMessage("task", item)
+                        for item in self._task_notifications.take_notifications()
+                    )
                 reminders = tuple(reminder_items)
                 active_content = (
                     self._skill_runtime.active_prompt() if self._skill_runtime is not None else ""
@@ -520,15 +577,30 @@ class AgentRunner:
                     reminders,
                 )
                 canonical_messages = (*history, *current)
+                snapshot_canonical = canonical_messages
+                snapshot_prefix = prompt_package.messages()
+                if self._request_seed:
+                    snapshot_canonical = tuple(current)
+                    extra_environment = (
+                        (EnvironmentMessage(active_content),) if active_content else ()
+                    )
+                    snapshot_prefix = (
+                        *self._request_seed,
+                        *extra_environment,
+                        *reminders,
+                    )
                 snapshot = await self._context_or_cancel(
                     self.context_manager.build_snapshot(
-                        canonical_messages,
+                        snapshot_canonical,
                         definitions,
-                        prefix_messages=prompt_package.messages(),
+                        prefix_messages=snapshot_prefix,
                     ),
                     cancel_event,
                 )
                 request_messages = snapshot.messages
+                self._delegation_snapshot = DelegationSnapshot(
+                    tuple(request_messages), tuple(definitions), mode
+                )
                 if snapshot.compaction_result is not None:
                     result = snapshot.compaction_result
                     compact_error = "" if result.success else (result.failure_reason or "failed")
@@ -585,9 +657,9 @@ class AgentRunner:
                         emergency_attempted = True
                         emergency = await self._context_or_cancel(
                             self.context_manager.emergency_snapshot(
-                                canonical_messages,
+                                snapshot_canonical,
                                 definitions,
-                                prefix_messages=prompt_package.messages(),
+                                prefix_messages=snapshot_prefix,
                             ),
                             cancel_event,
                         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from kcode.conversation import AssistantMessage, Conversation, ToolResultMessage, UserMessage
 from kcode.events import AgentEvent, AgentStopped, AgentStopReason, TurnNotice
@@ -14,6 +15,9 @@ from kcode.skills.tools import LoadSkillTool
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry
 
+if TYPE_CHECKING:
+    from kcode.subagents.factory import SubAgentFactory
+
 
 @dataclass(frozen=True, slots=True)
 class SkillInvocation:
@@ -25,8 +29,13 @@ class SkillInvocation:
 
 
 class SkillExecutor:
-    def __init__(self, runtime: SkillRuntime) -> None:
+    def __init__(
+        self,
+        runtime: SkillRuntime,
+        factory: SubAgentFactory | None = None,
+    ) -> None:
         self.runtime = runtime
+        self.factory = factory
         self.active_runner: AgentRunner | None = None
 
     def prepare(self, name: str, arguments: str) -> SkillInvocation:
@@ -59,30 +68,41 @@ class SkillExecutor:
         if definition.meta.fork_context is ForkContext.RECENT:
             for user, assistant in self._recent_text_turns(parent.conversation):
                 conversation.commit(user, assistant)
-        child_runtime = SkillRuntime(self.runtime.catalog)
-        child_registry = self._child_registry(parent.registry, definition.meta.allowed_tools)
-        child_registry.register(LoadSkillTool(child_runtime))
-        child_executor = ToolExecutor(
-            child_registry,
-            parent.executor.permissions,
-            parent.executor.local_store,
-        )
-        child = AgentRunner(
-            parent.provider,
-            conversation,
-            child_registry,
-            child_executor,
-            parent.context,
-            parent.approve,
-            parent.config,
-        )
-        child.bind_skills(child_runtime)
-        if parent.hook_engine is not None:
-            child.bind_hooks(parent.hook_engine, parent.hook_session)
-        child_session = AgentSession(
-            session.permission_mode,
-            initial_mode=session.initial_mode,
-        )
+        if self.factory is not None:
+            built = self.factory.skill_fork(
+                parent,
+                session.permission_mode,
+                parent.approve,
+                definition.meta.allowed_tools,
+                conversation,
+            )
+            child = built.runner
+            child_session = built.session
+        else:
+            child_runtime = SkillRuntime(self.runtime.catalog)
+            child_registry = self._child_registry(parent.registry, definition.meta.allowed_tools)
+            child_registry.register(LoadSkillTool(child_runtime))
+            child_executor = ToolExecutor(
+                child_registry,
+                parent.executor.permissions,
+                parent.executor.local_store,
+            )
+            child = AgentRunner(
+                parent.provider,
+                conversation,
+                child_registry,
+                child_executor,
+                parent.context,
+                parent.approve,
+                parent.config,
+            )
+            child.bind_skills(child_runtime)
+            if parent.hook_engine is not None:
+                child.bind_hooks(parent.hook_engine, parent.hook_session)
+            child_session = AgentSession(
+                session.permission_mode,
+                initial_mode=session.initial_mode,
+            )
         self.active_runner = child
         stopped: AgentStopped | None = None
         try:
@@ -116,10 +136,12 @@ class SkillExecutor:
 
     @staticmethod
     def _child_registry(parent: ToolRegistry, allowed_tools: tuple[str, ...]) -> ToolRegistry:
+        from kcode.subagents.filter import CONTROL_TOOL_NAMES
+
         allowed = set(allowed_tools) if allowed_tools else parent.names()
         registry = ToolRegistry()
         for tool in parent.tools():
-            if tool.spec.name == "load_skill":
+            if tool.spec.name == "load_skill" or tool.spec.name in CONTROL_TOOL_NAMES:
                 continue
             if tool.spec.name in allowed or tool.spec.always_visible:
                 registry.register(tool)

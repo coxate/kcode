@@ -11,6 +11,7 @@ from kcode.hooks.executor import HookActionExecutor
 from kcode.hooks.models import HookContext, HookEvent, HookSource
 from kcode.hooks.parser import parse_hook
 from kcode.permissions.models import PermissionMode
+from kcode.subagents.manager import LaunchResult
 
 
 def make_hook(value):
@@ -149,3 +150,50 @@ async def test_http_failure_and_large_response_are_safe_warnings(tmp_path: Path)
     assert result.warning is not None
     assert result.warning.code == "http_failed"
     assert "secret upstream detail" not in result.warning.render()
+
+
+async def test_agent_action_redacts_prompt_and_blocks_subagent_recursion(tmp_path: Path) -> None:
+    class Launcher:
+        prompt = ""
+
+        async def launch_hook(self, **values):
+            self.prompt = values["prompt"]
+            return LaunchResult("task-123456789abc", "async_launched")
+
+    hook = make_hook(
+        {
+            "id": "review",
+            "event": "file_change",
+            "async": True,
+            "action": {
+                "type": "agent",
+                "subagent_type": "explore",
+                "prompt": "check $MESSAGE",
+            },
+        }
+    )
+    launcher = Launcher()
+    executor = HookActionExecutor(
+        sensitive_values=("secret-token",),
+        agent_launcher=launcher,
+    )
+    main_context = HookContext(
+        HookEvent.FILE_CHANGE,
+        "session",
+        tmp_path,
+        PermissionMode.DEFAULT,
+        message="secret-token",
+    )
+    result = await executor.execute(hook, main_context)
+    assert result.warning is None
+    assert launcher.prompt == "check [REDACTED]"
+
+    child_context = HookContext(
+        HookEvent.FILE_CHANGE,
+        "session",
+        tmp_path,
+        PermissionMode.DEFAULT,
+        is_subagent=True,
+    )
+    result = await executor.execute(hook, child_context)
+    assert result.warning.code == "agent_recursion"

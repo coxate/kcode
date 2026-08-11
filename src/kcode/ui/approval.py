@@ -41,6 +41,8 @@ class ApprovalScreen(ModalScreen[ApprovalChoice | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="approval-dialog"):
             yield Label(f"工具授权：{self.request.tool_name}")
+            if self.request.source_label:
+                yield Static(f"来源：{self.request.source_label}", markup=False)
             yield Static(self.request.preview, id="approval-summary", markup=False)
             yield Static(self.request.reason, markup=False)
             with Vertical(id="approval-actions"):

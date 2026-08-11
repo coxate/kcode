@@ -16,6 +16,7 @@ from pydantic import (
     TypeAdapter,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 from kcode.errors import ConfigError
@@ -93,6 +94,22 @@ class MemoryConfig(BaseModel):
     enabled: bool = False
 
 
+class SubAgentConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = True
+    background_enabled: bool = True
+    auto_background_seconds: float = Field(default=120.0, ge=0.1, le=3600.0)
+    max_running: int = Field(default=4, ge=1, le=16)
+    max_retained: int = Field(default=20, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def retained_covers_running(self) -> SubAgentConfig:
+        if self.max_retained < self.max_running:
+            raise ValueError("max_retained must be greater than or equal to max_running")
+        return self
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -101,6 +118,8 @@ class AppConfig(BaseModel):
     agent: AgentConfig = AgentConfig()
     memory: MemoryConfig = MemoryConfig()
     memory_warnings: tuple[str, ...] = ()
+    subagents: SubAgentConfig = SubAgentConfig()
+    subagent_warnings: tuple[str, ...] = ()
     mcp_servers: tuple[McpServerConfig, ...] = ()
     mcp_warnings: tuple[str, ...] = ()
 
@@ -152,6 +171,9 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     memory = value.get("memory", {})
     if not isinstance(memory, dict):
         raise ConfigError(f"Invalid config {path}, field 'memory': expected a mapping.")
+    subagents = value.get("subagents", {})
+    if not isinstance(subagents, dict):
+        raise ConfigError(f"Invalid config {path}, field 'subagents': expected a mapping.")
     return value
 
 
@@ -165,6 +187,8 @@ def _merge_configs(
     mcp_warnings: list[str] = []
     memory: dict[str, Any] = {}
     memory_warnings: list[str] = []
+    subagents: dict[str, Any] = {}
+    subagent_warnings: list[str] = []
     for path, raw, source in configs:
         if "active_provider" in raw:
             active = raw["active_provider"]
@@ -186,12 +210,22 @@ def _merge_configs(
                 "enable long-term memory in ~/.kcode/config.yaml after reviewing its cost "
                 "and plaintext-storage notice."
             )
+        raw_subagents = raw.get("subagents", {})
+        if source == "user":
+            subagents.update(raw_subagents)
+        elif raw_subagents:
+            subagent_warnings.append(
+                f"KCode ignored project subagents settings from {path}; "
+                "configure SubAgents in ~/.kcode/config.yaml."
+            )
     return {
         "active_provider": active,
         "providers": list(merged.values()),
         "agent": agent,
         "memory": memory,
         "memory_warnings": memory_warnings,
+        "subagents": subagents,
+        "subagent_warnings": subagent_warnings,
         "mcp_servers": mcp_servers,
         "mcp_warnings": mcp_warnings,
     }
@@ -301,6 +335,8 @@ def load_config(
             agent=AgentConfig.model_validate(merged["agent"]),
             memory=MemoryConfig.model_validate(merged["memory"]),
             memory_warnings=tuple(merged["memory_warnings"]),
+            subagents=merged["subagents"],
+            subagent_warnings=tuple(merged["subagent_warnings"]),
             mcp_servers=tuple(mcp_servers),
             mcp_warnings=tuple(mcp_warnings),
         )

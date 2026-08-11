@@ -4,6 +4,7 @@ import asyncio
 
 from kcode.hooks.executor import HookActionExecutor
 from kcode.hooks.models import (
+    AgentAction,
     CommandAction,
     Hook,
     HookCatalog,
@@ -41,6 +42,9 @@ class HookEngine:
     def update_sensitive_values(self, values: tuple[str, ...]) -> None:
         self.sensitive_values = values
         self.executor.update_sensitive_values(values)
+
+    def bind_agent_launcher(self, launcher) -> None:
+        self.executor.bind_agent_launcher(launcher)
 
     def summaries(self) -> tuple[HookSummary, ...]:
         return self.catalog.summaries()
@@ -87,6 +91,26 @@ class HookEngine:
                 ),
                 False,
             )
+        if isinstance(hook.action, AgentAction):
+            try:
+                result = await self.executor.execute(hook, context)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return (
+                    None,
+                    (
+                        HookWarning(
+                            "action_failed",
+                            f"action failed ({type(exc).__name__})",
+                            hook.id,
+                            hook.event,
+                        ),
+                    ),
+                    False,
+                )
+            warnings = (result.warning,) if result.warning is not None else ()
+            return None, warnings, result.warning is None
         if hook.run_async:
             if not self.runtime.spawn(self._background(hook, context)):
                 return (

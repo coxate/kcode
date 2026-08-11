@@ -312,11 +312,15 @@ class ToolExecutor:
                 use_shell=prepared.call.name == "run_command",
             )
             timeout = (
-                prepared.arguments.timeout_seconds
-                if isinstance(prepared.arguments, RunCommandArgs)
-                else context.limits.command_timeout_seconds
-                if prepared.call.name.startswith("mcp__")
-                else context.limits.file_timeout_seconds
+                None
+                if prepared.tool.spec.self_managed_timeout
+                else (
+                    prepared.arguments.timeout_seconds
+                    if isinstance(prepared.arguments, RunCommandArgs)
+                    else context.limits.command_timeout_seconds
+                    if prepared.call.name.startswith("mcp__")
+                    else context.limits.file_timeout_seconds
+                )
             )
             execution_task = asyncio.create_task(
                 prepared.tool.execute(prepared.arguments, execution_context)
@@ -361,7 +365,7 @@ class ToolExecutor:
                     "timeout",
                     "Tool execution exceeded its timeout.",
                     status="timeout",
-                    details={"seconds": timeout},
+                    details={"seconds": timeout or 0},
                 )
             if cancellation_task is not None:
                 cancellation_task.cancel()

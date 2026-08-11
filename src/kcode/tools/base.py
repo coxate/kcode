@@ -161,6 +161,8 @@ class ApprovalRequest:
     preview: str
     reason: str
     permanent_rule: str
+    source_label: str | None = None
+    task_id: str | None = None
 
 
 ApprovalHandler: TypeAlias = Callable[[ApprovalRequest], Awaitable["ApprovalChoice"]]
@@ -174,6 +176,7 @@ class ToolSpec:
     effect: ToolEffect | None = ToolEffect.READ_ONLY
     parameters: Mapping[str, Any] | None = None
     always_visible: bool = False
+    self_managed_timeout: bool = False
 
 
 class Tool(Protocol):

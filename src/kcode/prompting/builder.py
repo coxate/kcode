@@ -49,6 +49,20 @@ class SystemPromptBuilder:
         )
         return SystemPromptBuilder(sections)
 
+    def content(self, name: str) -> str:
+        section = next((item for item in self._sections if item.name == name), None)
+        if section is None:
+            raise KeyError(f"Unknown prompt section: {name}.")
+        return section.content
+
+    def with_appended_content(self, name: str, content: str) -> SystemPromptBuilder:
+        current = self.content(name).strip()
+        appended = content.strip()
+        return self.with_content(
+            name,
+            "\n\n".join(item for item in (current, appended) if item),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PromptPackage:

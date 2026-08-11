@@ -6,11 +6,13 @@ import os
 import signal
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Protocol
 from urllib.parse import urlparse
 
 import httpx
 
 from kcode.hooks.models import (
+    AgentAction,
     CommandAction,
     Hook,
     HookContext,
@@ -21,6 +23,17 @@ from kcode.hooks.models import (
 from kcode.hooks.parser import expand_template
 
 MAX_OUTPUT_BYTES = 32 * 1024
+
+
+class AgentActionLauncher(Protocol):
+    async def launch_hook(
+        self,
+        *,
+        prompt: str,
+        subagent_type: str,
+        name: str | None,
+        mode,
+    ): ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,10 +48,15 @@ class HookActionExecutor:
         *,
         sensitive_values: tuple[str, ...] = (),
         http_transport: httpx.AsyncBaseTransport | None = None,
+        agent_launcher: AgentActionLauncher | None = None,
     ) -> None:
         self.sensitive_values = sensitive_values
         self._http_transport = http_transport
         self._client: httpx.AsyncClient | None = None
+        self.agent_launcher = agent_launcher
+
+    def bind_agent_launcher(self, launcher: AgentActionLauncher) -> None:
+        self.agent_launcher = launcher
 
     def update_sensitive_values(self, values: tuple[str, ...]) -> None:
         self.sensitive_values = values
@@ -51,7 +69,52 @@ class HookActionExecutor:
             return HookActionResult(expand_template(action.message, context))
         if isinstance(action, HttpAction):
             return await self._http(hook, action, context)
+        if isinstance(action, AgentAction):
+            return await self._agent(hook, action, context)
         return HookActionResult()
+
+    async def _agent(
+        self,
+        hook: Hook,
+        action: AgentAction,
+        context: HookContext,
+    ) -> HookActionResult:
+        if context.is_subagent:
+            return HookActionResult(
+                warning=HookWarning(
+                    "agent_recursion",
+                    "SubAgent Hooks cannot launch another Agent",
+                    hook.id,
+                    hook.event,
+                )
+            )
+        if self.agent_launcher is None:
+            return HookActionResult(
+                warning=HookWarning(
+                    "agent_unavailable",
+                    "SubAgent launcher is unavailable",
+                    hook.id,
+                    hook.event,
+                )
+            )
+        prompt = self._redact(expand_template(action.prompt, context))
+        try:
+            launched = await self.agent_launcher.launch_hook(
+                prompt=prompt,
+                subagent_type=action.subagent_type,
+                name=action.name,
+                mode=context.mode,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return HookActionResult(
+                warning=HookWarning(
+                    "agent_launch_failed",
+                    f"SubAgent task was not launched ({type(exc).__name__})",
+                    hook.id,
+                    hook.event,
+                )
+            )
+        return HookActionResult(f"SubAgent task launched: {launched.task_id}")
 
     async def _drain(self, stream: asyncio.StreamReader | None) -> bytes:
         if stream is None:

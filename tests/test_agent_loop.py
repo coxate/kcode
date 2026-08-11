@@ -638,3 +638,29 @@ async def test_invalid_answer_does_not_submit_memory_turn(tmp_path) -> None:
     events = [event async for event in runner.run("remember")]
     assert events[-1].reason == AgentStopReason.INVALID_RESPONSE
     assert memory.turns == []
+
+
+async def test_task_notification_is_consumed_once_without_entering_history(tmp_path) -> None:
+    class Notifications:
+        def __init__(self):
+            self.values = ("<task-notification>done</task-notification>",)
+
+        def take_notifications(self):
+            values = self.values
+            self.values = ()
+            return values
+
+    conversation = Conversation()
+    provider = ScriptedProvider([[TextDelta("acknowledged"), StreamCompleted("stop")]])
+    runner = make_runner(tmp_path, provider, conversation=conversation)
+    source = Notifications()
+    runner.bind_task_notifications(source)
+    [event async for event in runner.run("continue")]
+    reminder = next(
+        item
+        for item in provider.requests[0][0]
+        if isinstance(item, SystemReminderMessage) and item.kind == "task"
+    )
+    assert "task-notification" in reminder.content
+    assert source.values == ()
+    assert "task-notification" not in repr(conversation.messages_snapshot())

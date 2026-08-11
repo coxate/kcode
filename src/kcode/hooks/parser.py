@@ -19,6 +19,7 @@ from pydantic import (
 )
 
 from kcode.hooks.models import (
+    AgentAction,
     CompiledMatcher,
     Condition,
     ConditionGroup,
@@ -194,6 +195,8 @@ def parse_hook(
             if "$" not in action.url and urlparse(action.url).scheme not in {"http", "https"}:
                 raise ValueError("http url must use http or https")
             action = action.model_copy(update={"method": method})
+        if isinstance(action, AgentAction) and not raw.run_async:
+            raise ValueError("agent actions require async: true")
         if raw.run_async and (
             raw.event is HookEvent.PRE_TOOL_USE
             or raw.reject

@@ -109,6 +109,29 @@ def test_invalid_hook_warning_does_not_include_action_body(tmp_path: Path) -> No
     assert secret not in warning.render()
 
 
+def test_agent_action_requires_background_and_a_defined_role(tmp_path: Path) -> None:
+    value = {
+        "id": "agent-review",
+        "event": "file_change",
+        "async": True,
+        "action": {
+            "type": "agent",
+            "subagent_type": "explore",
+            "prompt": "review $FILE_PATH",
+        },
+    }
+    hook, warning = parse_hook(value, HookSource.USER, tmp_path / "hooks.yaml", 0)
+    assert warning is None and hook is not None
+
+    hook, warning = parse_hook(
+        {**value, "async": False},
+        HookSource.USER,
+        tmp_path / "hooks.yaml",
+        0,
+    )
+    assert hook is None and warning is not None
+
+
 @pytest.mark.parametrize(
     "changes",
     [
