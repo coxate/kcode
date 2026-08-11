@@ -2,6 +2,7 @@ from pathlib import Path
 
 from textual.widgets import Input, Static
 
+from kcode.hooks.catalog import HookCatalogBuilder
 from kcode.mcp.manager import McpStartupSummary
 from kcode.mcp.trust import McpTrustRequest
 from kcode.ui.app import KCodeApp
@@ -59,6 +60,11 @@ class FakeManager:
         self.closed = True
 
 
+class FailingManager(FakeManager):
+    async def prepare(self, trust):
+        raise RuntimeError("connection setup failed")
+
+
 async def test_project_trust_is_shown_before_ready_without_secret_value(
     tmp_path: Path,
 ) -> None:
@@ -91,3 +97,29 @@ async def test_mcp_trust_clear_command_uses_current_project(tmp_path: Path) -> N
         await pilot.press("enter")
         await pilot.pause()
         assert manager.trust_store.cleared
+
+
+async def test_mcp_failure_does_not_skip_hook_finalization(tmp_path: Path) -> None:
+    user_hooks = tmp_path / "user-hooks.yaml"
+    user_hooks.write_text(
+        "hooks:\n"
+        "  - id: mcp-fallback\n"
+        "    event: startup\n"
+        "    action: {type: prompt, message: continue without MCP}\n",
+        encoding="utf-8",
+    )
+    manager = FailingManager(tmp_path)
+    builder = HookCatalogBuilder(tmp_path, user_path=user_hooks)
+    app = KCodeApp(
+        FakeProvider(),
+        cwd=tmp_path,
+        mcp_manager=manager,
+        hook_builder=builder,
+    )
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        assert not app.query_one("#prompt", Input).disabled
+        assert app.command_registry.frozen
+        assert [item.id for item in app.command_hooks()] == ["mcp-fallback"]
+        assert "Skills/Hooks are available" in str(app.query_one("#ready", Static).content)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol, Sequence
 
@@ -33,6 +33,8 @@ class SessionRuntime:
     journal: SessionJournal
     resume_reminder: SystemReminderMessage | None = None
     active_skill_names: tuple[str, ...] = ()
+    executed_hook_ids: set[str] = field(default_factory=set)
+    pending_hook_prompts: list[str] = field(default_factory=list)
 
     @property
     def session_id(self) -> str:

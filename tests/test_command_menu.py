@@ -96,5 +96,5 @@ async def test_enter_executes_highlighted_command_and_menu_has_six_line_cap(
 
         prompt.value = "/"
         await pilot.pause()
-        assert menu.option_count == 16
+        assert menu.option_count == 17
         assert menu.size.height <= 6

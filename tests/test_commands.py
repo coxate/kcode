@@ -17,6 +17,7 @@ from kcode.commands import (
     create_builtin_registry,
     register_skill_commands,
 )
+from kcode.hooks.models import HookEvent, HookSource, HookSummary
 from kcode.skills.models import SkillSummary
 
 
@@ -27,6 +28,7 @@ class FakeHost:
     mode: str = "default"
     compact_focus: str | None = None
     executed_skills: list[tuple[str, str]] = field(default_factory=list)
+    hook_commands: list[tuple[str, str, CommandType]] = field(default_factory=list)
 
     async def command_notice(self, text: str, style: str = "system") -> None:
         self.notices.append((text, style))
@@ -39,6 +41,25 @@ class FakeHost:
 
     async def command_execute_skill(self, name: str, args: str) -> None:
         self.executed_skills.append((name, args))
+
+    def command_hooks(self) -> tuple[HookSummary, ...]:
+        return (
+            HookSummary(
+                "protect",
+                HookEvent.PRE_TOOL_USE,
+                "reject",
+                True,
+                False,
+                True,
+                HookSource.PROJECT,
+            ),
+        )
+
+    async def command_hook_execute(self, name: str, args: str, command_type: CommandType) -> None:
+        self.hook_commands.append((name, args, command_type))
+
+    async def command_hook_error(self, name: str, error_type: str) -> None:
+        return None
 
     def command_enter_plan(self) -> None:
         self.mode = "plan"
@@ -87,7 +108,7 @@ def test_parse_plain_slash_case_and_original_arguments() -> None:
 def test_builtin_commands_aliases_and_candidates() -> None:
     registry = create_builtin_registry()
 
-    assert len(registry.visible_commands()) == 13
+    assert len(registry.visible_commands()) == 14
     assert registry.resolve("H").name == "help"
     assert registry.resolve("?").name == "help"
     assert registry.resolve("C").name == "compact"
@@ -98,6 +119,18 @@ def test_builtin_commands_aliases_and_candidates() -> None:
         "skill",
         "status",
     ]
+
+
+@pytest.mark.asyncio
+async def test_hooks_command_lists_only_safe_summary_and_emits_command_event() -> None:
+    registry = create_builtin_registry()
+    host = FakeHost()
+    await CommandDispatcher(registry).dispatch("/hooks", host)
+    text = host.notices[-1][0]
+    assert "protect" in text
+    assert "pre_tool_use" in text
+    assert "reject" in text
+    assert host.hook_commands == [("hooks", "", CommandType.LOCAL)]
 
 
 def test_registration_rejects_name_alias_and_case_conflicts() -> None:
@@ -171,7 +204,7 @@ async def test_help_is_sorted_and_old_mcp_syntax_is_unknown() -> None:
     await dispatcher.dispatch("/", host)
     lines = host.notices[-1][0].splitlines()[1:]
     assert lines == sorted(lines)
-    assert len(lines) == 13
+    assert len(lines) == 14
     await dispatcher.dispatch("/help s", host)
     assert "名称：/status" in host.notices[-1][0]
     await dispatcher.dispatch("/mcp trust clear", host)
@@ -220,7 +253,7 @@ async def test_delayed_freeze_registers_dynamic_skills() -> None:
     registry.freeze()
     registry.freeze()
     assert registry.frozen
-    assert len(registry.visible_commands()) == 16
+    assert len(registry.visible_commands()) == 17
     host = FakeHost()
     assert await CommandDispatcher(registry).dispatch("/review 并发 安全", host)
     assert host.executed_skills == [("review", "并发 安全")]

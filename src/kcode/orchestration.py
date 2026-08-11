@@ -43,6 +43,12 @@ from kcode.events import (
 )
 from kcode.history.models import PersistenceState
 from kcode.history.runtime import SessionRuntime
+from kcode.hooks.models import (
+    HookContext,
+    HookDispatchResult,
+    HookEvent,
+    ToolRejectedError,
+)
 from kcode.memory.models import CompletedTurn
 from kcode.memory.runtime import MemoryCoordinator
 from kcode.permissions.models import PermissionMode
@@ -62,6 +68,8 @@ from kcode.tools.registry import ToolRegistry
 from kcode.tools.scheduler import ToolScheduler
 
 if TYPE_CHECKING:
+    from kcode.hooks.engine import HookEngine
+    from kcode.hooks.runtime import HookSession
     from kcode.skills.runtime import SkillRuntime
 
 PLAN_TOOL_NAMES = {"read_file", "find_files", "search_code", "run_command"}
@@ -161,6 +169,8 @@ class AgentRunner:
         self._session_runtime: SessionRuntime | None = None
         self._memory_coordinator: MemoryCoordinator | None = None
         self._skill_runtime: SkillRuntime | None = None
+        self._hook_engine: HookEngine | None = None
+        self._hook_session: HookSession | None = None
 
     def cancel(self) -> None:
         if self._cancel_event is not None:
@@ -172,6 +182,7 @@ class AgentRunner:
         self._session_runtime = runtime
         self.conversation = runtime.conversation
         self.context_manager = runtime.context_manager
+        self._hook_session = runtime
         if self._skill_runtime is not None:
             return self._skill_runtime.bind_session(runtime)
         return ()
@@ -186,6 +197,24 @@ class AgentRunner:
             raise RuntimeError("Cannot bind Skills while the agent is running.")
         self._skill_runtime = runtime
         return runtime.bind_session(self._session_runtime)
+
+    def bind_hooks(
+        self,
+        engine: HookEngine,
+        session: HookSession | None = None,
+    ) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind Hooks while the agent is running.")
+        self._hook_engine = engine
+        self._hook_session = session if session is not None else self._session_runtime
+
+    @property
+    def hook_engine(self) -> HookEngine | None:
+        return self._hook_engine
+
+    @property
+    def hook_session(self) -> HookSession | None:
+        return self._hook_session
 
     def update_available_skills(self, content: str) -> None:
         if self._cancel_event is not None:
@@ -204,6 +233,8 @@ class AgentRunner:
         self.context_manager.update_sensitive_values(context.sensitive_values)
         if self._session_runtime is not None:
             self._session_runtime.journal.update_sensitive_values(context.sensitive_values)
+        if self._hook_engine is not None:
+            self._hook_engine.update_sensitive_values(context.sensitive_values)
 
     async def clear_context(self) -> None:
         await self.context_manager.clear()
@@ -252,12 +283,33 @@ class AgentRunner:
             raise RuntimeError("Cannot compact context while the agent is running.")
         active_session = session or AgentSession()
         definitions = self._definitions_for_mode(active_session.permission_mode)
-        return await self.context_manager.compact(
+        snapshot = await self.context_manager.compact(
             self.conversation.messages_snapshot(),
             definitions,
             prefix_messages=(self._stable_system,),
             focus=focus,
         )
+        result = snapshot.compaction_result
+        if result is not None and self._hook_engine is not None:
+            error = "" if result.success else (result.failure_reason or "failed")
+            hook_result = await self._run_hooks(
+                HookEvent.COMPACT,
+                active_session.permission_mode,
+                message=f"manual: {result.before_tokens} -> {result.after_tokens or '?'}",
+                error=error,
+            )
+            for warning in hook_result.warnings:
+                self._hook_engine.runtime.add_warning(warning)
+            if error:
+                error_result = await self._run_hooks(
+                    HookEvent.ERROR,
+                    active_session.permission_mode,
+                    message="compact",
+                    error=error,
+                )
+                for warning in error_result.warnings:
+                    self._hook_engine.runtime.add_warning(warning)
+        return snapshot
 
     def _definitions_for_mode(self, mode: PermissionMode):
         plan_tools = PLAN_TOOL_NAMES | self.registry.names_with_effect(ToolEffect.READ_ONLY)
@@ -265,6 +317,51 @@ class AgentRunner:
 
     def tool_definitions(self, mode: PermissionMode):
         return self._definitions_for_mode(mode)
+
+    def _hook_context(
+        self,
+        event: HookEvent,
+        mode: PermissionMode,
+        *,
+        message: str = "",
+        error: str = "",
+        command: str = "",
+        tool_name: str = "",
+        tool_args=None,
+        file_path: str = "",
+        tool_status: str = "",
+        iteration: int = 0,
+    ) -> HookContext:
+        session_id = (
+            self._session_runtime.session_id if self._session_runtime is not None else "in-memory"
+        )
+        return HookContext(
+            event,
+            session_id,
+            self.context.workspace_root,
+            mode,
+            tool_name,
+            tool_args or {},
+            file_path,
+            message,
+            error,
+            command,
+            tool_status,
+            iteration,
+        )
+
+    async def _run_hooks(
+        self,
+        event: HookEvent,
+        mode: PermissionMode,
+        **values,
+    ) -> HookDispatchResult:
+        if self._hook_engine is None:
+            return HookDispatchResult()
+        return await self._hook_engine.run_hooks(
+            self._hook_context(event, mode, **values),
+            self._hook_session,
+        )
 
     async def _context_or_cancel(
         self,
@@ -361,6 +458,8 @@ class AgentRunner:
             model=self.provider.model_name,
         )
         iteration = 0
+        turn_end_message = ""
+        turn_end_error = "cancelled"
 
         try:
             if (
@@ -368,6 +467,13 @@ class AgentRunner:
                 and active_runtime.journal.state == PersistenceState.DEGRADED
             ):
                 yield TurnNotice(self._persistence_warning(active_runtime))
+            start_hooks = await self._run_hooks(
+                HookEvent.TURN_START,
+                active_session.permission_mode,
+                message=user_text,
+            )
+            for warning in start_hooks.warnings:
+                yield TurnNotice(warning.render())
             for iteration in range(1, self.config.max_iterations + 1):
                 if cancel_event.is_set():
                     raise _AgentCancelled
@@ -380,6 +486,14 @@ class AgentRunner:
                     AgentPhase.MODEL,
                 )
                 response: ModelResponse | None = None
+                send_hooks = await self._run_hooks(
+                    HookEvent.PRE_SEND,
+                    mode,
+                    message=user_text,
+                    iteration=iteration,
+                )
+                for warning in send_hooks.warnings:
+                    yield TurnNotice(warning.render())
                 reminder_items = []
                 if mode == PermissionMode.PLAN:
                     reminder_items.append(build_plan_mode_reminder(iteration))
@@ -387,6 +501,10 @@ class AgentRunner:
                     reminder_items.append(approved_plan_reminder)
                 if resume_reminder is not None:
                     reminder_items.append(resume_reminder)
+                if self._hook_engine is not None:
+                    reminder_items.extend(
+                        self._hook_engine.runtime.take_prompts(self._hook_session)
+                    )
                 reminders = tuple(reminder_items)
                 active_content = (
                     self._skill_runtime.active_prompt() if self._skill_runtime is not None else ""
@@ -413,6 +531,28 @@ class AgentRunner:
                 request_messages = snapshot.messages
                 if snapshot.compaction_result is not None:
                     result = snapshot.compaction_result
+                    compact_error = "" if result.success else (result.failure_reason or "failed")
+                    compact_hooks = await self._run_hooks(
+                        HookEvent.COMPACT,
+                        mode,
+                        message=(
+                            f"automatic: {result.before_tokens} -> {result.after_tokens or '?'}"
+                        ),
+                        error=compact_error,
+                        iteration=iteration,
+                    )
+                    for warning in compact_hooks.warnings:
+                        yield TurnNotice(warning.render())
+                    if compact_error:
+                        compact_error_hooks = await self._run_hooks(
+                            HookEvent.ERROR,
+                            mode,
+                            message="compact",
+                            error=compact_error,
+                            iteration=iteration,
+                        )
+                        for warning in compact_error_hooks.warnings:
+                            yield TurnNotice(warning.render())
                     if result.success:
                         yield TurnNotice(
                             "上下文已自动压缩："
@@ -421,6 +561,11 @@ class AgentRunner:
                         )
                     else:
                         yield TurnNotice(f"自动上下文压缩失败：{result.failure_reason}")
+                    if self._hook_engine is not None:
+                        request_messages = (
+                            *request_messages,
+                            *self._hook_engine.runtime.take_prompts(self._hook_session),
+                        )
                 emergency_attempted = False
                 while True:
                     try:
@@ -446,6 +591,36 @@ class AgentRunner:
                             ),
                             cancel_event,
                         )
+                        emergency_result = emergency.compaction_result
+                        if emergency_result is not None:
+                            emergency_error = (
+                                ""
+                                if emergency_result.success
+                                else (emergency_result.failure_reason or "failed")
+                            )
+                            emergency_hooks = await self._run_hooks(
+                                HookEvent.COMPACT,
+                                mode,
+                                message=(
+                                    "emergency: "
+                                    f"{emergency_result.before_tokens} -> "
+                                    f"{emergency_result.after_tokens or '?'}"
+                                ),
+                                error=emergency_error,
+                                iteration=iteration,
+                            )
+                            for warning in emergency_hooks.warnings:
+                                yield TurnNotice(warning.render())
+                            if emergency_error:
+                                error_hooks = await self._run_hooks(
+                                    HookEvent.ERROR,
+                                    mode,
+                                    message="compact",
+                                    error=emergency_error,
+                                    iteration=iteration,
+                                )
+                                for warning in error_hooks.warnings:
+                                    yield TurnNotice(warning.render())
                         if not emergency.budget.fits_after_emergency:
                             raise ProviderError(
                                 ProviderErrorKind.PROMPT_TOO_LONG,
@@ -453,9 +628,23 @@ class AgentRunner:
                                 "context window.",
                             ) from exc
                         request_messages = emergency.messages
+                        if self._hook_engine is not None:
+                            request_messages = (
+                                *request_messages,
+                                *self._hook_engine.runtime.take_prompts(self._hook_session),
+                            )
                         response = None
                         yield TurnNotice("上下文超过模型窗口，已紧急压缩并重试一次。")
                 assert response is not None
+
+                receive_hooks = await self._run_hooks(
+                    HookEvent.POST_RECEIVE,
+                    mode,
+                    message=response.text[: 32 * 1024],
+                    iteration=iteration,
+                )
+                for warning in receive_hooks.warnings:
+                    yield TurnNotice(warning.render())
 
                 request_usage = response.usage or TokenUsage()
                 cumulative_usage = (
@@ -472,6 +661,7 @@ class AgentRunner:
 
                 if not response.tool_calls:
                     if not response.text.strip():
+                        turn_end_error = "invalid_response"
                         self.conversation.stop_turn(handle)
                         turn_open = False
                         yield AgentStopped(
@@ -481,6 +671,8 @@ class AgentRunner:
                         )
                         return
                     final = AssistantMessage(response.text)
+                    turn_end_message = response.text
+                    turn_end_error = ""
                     self.conversation.complete_turn(handle, final)
                     turn_open = False
                     persisted_index, saved = await self._persist_since(
@@ -522,9 +714,43 @@ class AgentRunner:
                     response.tool_calls,
                     response.continuation_state,
                 )
-                prepared = tuple(
-                    self.executor.prepare(call, self.context, mode) for call in response.tool_calls
-                )
+                prepared_items = []
+                for call in response.tool_calls:
+                    validated = self.executor.validate(call)
+                    if validated.error is not None or self._hook_engine is None:
+                        prepared_items.append(
+                            self.executor.authorize(validated, self.context, mode)
+                        )
+                        continue
+                    assert validated.arguments is not None
+                    arguments = validated.arguments.model_dump(mode="json")
+                    path = arguments.get("path")
+                    pre_result = await self._hook_engine.run_pre_tool_hooks(
+                        self._hook_context(
+                            HookEvent.PRE_TOOL_USE,
+                            mode,
+                            tool_name=call.name,
+                            tool_args=arguments,
+                            file_path=path if isinstance(path, str) else "",
+                            iteration=iteration,
+                        ),
+                        self._hook_session,
+                    )
+                    if isinstance(pre_result, ToolRejectedError):
+                        prepared_items.append(
+                            self.executor.rejected(
+                                validated,
+                                hook_id=pre_result.hook_id,
+                                reason=pre_result.reason,
+                            )
+                        )
+                    else:
+                        for warning in pre_result.warnings:
+                            yield TurnNotice(warning.render())
+                        prepared_items.append(
+                            self.executor.authorize(validated, self.context, mode)
+                        )
+                prepared = tuple(prepared_items)
                 all_unknown = bool(prepared) and all(
                     item.error is not None
                     and item.error.error is not None
@@ -549,7 +775,25 @@ class AgentRunner:
                             AgentPhase.APPROVAL,
                             batch_index,
                         )
-                        for request in approvals:
+                        for item in batch.calls:
+                            request = item.approval
+                            if request is None:
+                                continue
+                            arguments = (
+                                item.arguments.model_dump(mode="json")
+                                if item.arguments is not None
+                                else {}
+                            )
+                            permission_hooks = await self._run_hooks(
+                                HookEvent.PERMISSION_REQUEST,
+                                mode,
+                                message=request.reason,
+                                tool_name=item.call.name,
+                                tool_args=arguments,
+                                iteration=iteration,
+                            )
+                            for warning in permission_hooks.warnings:
+                                yield TurnNotice(warning.render())
                             yield ApprovalPending(request)
                     yield AgentProgress(
                         mode,
@@ -568,6 +812,40 @@ class AgentRunner:
                     )
                     batch_messages: list[ToolResultMessage] = []
                     for item, result in zip(batch.calls, results, strict=True):
+                        arguments = (
+                            item.arguments.model_dump(mode="json")
+                            if item.arguments is not None
+                            else {}
+                        )
+                        raw_path = arguments.get("path")
+                        file_path = raw_path if isinstance(raw_path, str) else ""
+                        error_message = result.error.message if result.error is not None else ""
+                        post_hooks = await self._run_hooks(
+                            HookEvent.POST_TOOL_USE,
+                            mode,
+                            error=error_message,
+                            tool_name=item.call.name,
+                            tool_args=arguments,
+                            file_path=file_path,
+                            tool_status=result.status,
+                            iteration=iteration,
+                        )
+                        for warning in post_hooks.warnings:
+                            yield TurnNotice(warning.render())
+                        if result.error is not None:
+                            error_hooks = await self._run_hooks(
+                                HookEvent.ERROR,
+                                mode,
+                                message="tool",
+                                error=error_message,
+                                tool_name=item.call.name,
+                                tool_args=arguments,
+                                file_path=file_path,
+                                tool_status=result.status,
+                                iteration=iteration,
+                            )
+                            for warning in error_hooks.warnings:
+                                yield TurnNotice(warning.render())
                         if (
                             item.call.name == "read_file"
                             and result.status == "success"
@@ -577,6 +855,24 @@ class AgentRunner:
                             content = result.data.get("content")
                             if isinstance(path, str) and isinstance(content, str):
                                 await self.context_manager.record_file_snapshot(path, content)
+                        if (
+                            item.call.name in {"write_file", "edit_file"}
+                            and result.status == "success"
+                        ):
+                            normalized_path = file_path
+                            if result.data is not None and isinstance(result.data.get("path"), str):
+                                normalized_path = result.data["path"]
+                            file_hooks = await self._run_hooks(
+                                HookEvent.FILE_CHANGE,
+                                mode,
+                                tool_name=item.call.name,
+                                tool_args=arguments,
+                                file_path=normalized_path,
+                                tool_status=result.status,
+                                iteration=iteration,
+                            )
+                            for warning in file_hooks.warnings:
+                                yield TurnNotice(warning.render())
                         batch_messages.append(
                             ToolResultMessage(item.call.id, item.call.name, result)
                         )
@@ -599,6 +895,7 @@ class AgentRunner:
                 if cancel_event.is_set():
                     raise _AgentCancelled
                 if unknown_rounds >= 2:
+                    turn_end_error = "unknown_tool_limit"
                     self.conversation.stop_turn(handle)
                     turn_open = False
                     yield AgentStopped(
@@ -608,6 +905,7 @@ class AgentRunner:
                     )
                     return
                 if iteration >= self.config.max_iterations:
+                    turn_end_error = "iteration_limit"
                     self.conversation.stop_turn(handle)
                     turn_open = False
                     yield AgentStopped(
@@ -617,28 +915,61 @@ class AgentRunner:
                     )
                     return
         except _AgentCancelled:
+            turn_end_error = "cancelled"
             if turn_open:
                 self.conversation.stop_turn(handle)
                 turn_open = False
             yield AgentStopped(AgentStopReason.CANCELLED, iteration, "用户已取消当前任务。")
         except ProviderError as exc:
+            turn_end_error = str(exc)
             if turn_open:
                 self.conversation.stop_turn(handle)
                 turn_open = False
             yield TurnNotice(f"{exc.kind.value}: {exc}")
+            error_hooks = await self._run_hooks(
+                HookEvent.ERROR,
+                active_session.permission_mode,
+                message="provider",
+                error=str(exc),
+                iteration=iteration,
+            )
+            for warning in error_hooks.warnings:
+                yield TurnNotice(warning.render())
             yield AgentStopped(AgentStopReason.STREAM_ERROR, iteration, str(exc))
         except (ValueError, TypeError) as exc:
+            turn_end_error = str(exc)
             if turn_open:
                 self.conversation.stop_turn(handle)
                 turn_open = False
             yield TurnNotice(str(exc))
+            error_hooks = await self._run_hooks(
+                HookEvent.ERROR,
+                active_session.permission_mode,
+                message="agent",
+                error=str(exc),
+                iteration=iteration,
+            )
+            for warning in error_hooks.warnings:
+                yield TurnNotice(warning.render())
             yield AgentStopped(AgentStopReason.INVALID_RESPONSE, iteration, str(exc))
         finally:
             if turn_open:
                 self.conversation.stop_turn(handle)
             if active_runtime is not None and resume_reminder is not None:
                 active_runtime.consume_resume_reminder()
-            self._cancel_event = None
+            try:
+                if self._hook_engine is not None:
+                    end_hooks = await self._run_hooks(
+                        HookEvent.TURN_END,
+                        active_session.permission_mode,
+                        message=turn_end_message,
+                        error=turn_end_error,
+                        iteration=iteration,
+                    )
+                    for warning in end_hooks.warnings:
+                        self._hook_engine.runtime.add_warning(warning)
+            finally:
+                self._cancel_event = None
 
     async def _persist_since(
         self,

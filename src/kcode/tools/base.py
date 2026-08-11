@@ -193,6 +193,15 @@ class PreparedToolCall:
     error: ToolResult | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedToolCall:
+    call: ToolCall
+    tool: Tool | None
+    arguments: ToolArguments | None
+    declared_effect: ToolEffect
+    error: ToolResult | None = None
+
+
 class ToolExecutionError(Exception):
     def __init__(self, code: str, message: str, **details: JSONValue) -> None:
         super().__init__(message)

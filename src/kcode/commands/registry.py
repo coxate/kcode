@@ -121,8 +121,17 @@ class CommandDispatcher:
             await host.command_notice(f"用法：{command.usage}", "error")
             return True
         try:
+            before = getattr(host, "command_hook_execute", None)
+            if before is not None:
+                await before(command.name, parsed.args, command.type)
             await command.handler(CommandContext(parsed.args, host, self.registry))
         except Exception as exc:
+            on_error = getattr(host, "command_hook_error", None)
+            if on_error is not None:
+                try:
+                    await on_error(command.name, exc.__class__.__name__)
+                except Exception:
+                    pass
             await host.command_notice(
                 f"命令 /{command.name} 执行失败：{exc.__class__.__name__}。",
                 "error",

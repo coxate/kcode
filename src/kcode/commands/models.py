@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from kcode.commands.registry import CommandRegistry
+    from kcode.hooks.models import HookSummary
     from kcode.skills.models import SkillSummary
 
 
@@ -55,6 +56,17 @@ class CommandHost(Protocol):
     def command_skills(self) -> tuple[SkillSummary, ...]: ...
 
     async def command_execute_skill(self, name: str, args: str) -> None: ...
+
+    def command_hooks(self) -> tuple[HookSummary, ...]: ...
+
+    async def command_hook_execute(
+        self,
+        name: str,
+        args: str,
+        command_type: CommandType,
+    ) -> None: ...
+
+    async def command_hook_error(self, name: str, error_type: str) -> None: ...
 
     def command_enter_plan(self) -> None: ...
 

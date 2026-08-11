@@ -103,6 +103,7 @@ def test_rule_parser_and_globs() -> None:
     assert rule_matches(parse_rule("Write(src/**)"), "Write", "src/a/b.py")
     assert not rule_matches(parse_rule("Write(src/*)"), "Write", "src/a/b.py")
     assert rule_matches(parse_rule("Write(file?.txt)"), "Write", "file?.txt")
+    assert not rule_matches(parse_rule("Write(file?*.txt)"), "Write", "file-a.txt")
     with pytest.raises(ValueError):
         parse_rule("Shell(git status)")
     with pytest.raises(ValueError):

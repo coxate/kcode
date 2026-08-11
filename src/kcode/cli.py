@@ -8,6 +8,7 @@ from kcode.config import default_config_paths, load_config
 from kcode.conversation import Conversation
 from kcode.errors import ConfigError
 from kcode.history.runtime import SessionCoordinator
+from kcode.hooks import HookCatalogBuilder, HookEngine, HookTrustStore
 from kcode.instructions import InstructionLoader
 from kcode.mcp import McpManager, McpTrustStore
 from kcode.memory.runtime import MemoryCoordinator
@@ -113,6 +114,9 @@ def main() -> int:
         prompt_builder=prompt_builder,
         coordinator=coordinator,
         memory_coordinator=memory_coordinator,
+        hook_builder=HookCatalogBuilder(cwd),
+        hook_trust_store=HookTrustStore(),
+        hook_engine=HookEngine(),
     )
     app.run()
     return 0

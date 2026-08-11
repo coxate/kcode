@@ -40,6 +40,13 @@ from kcode.events import (
     TurnNotice,
 )
 from kcode.history.runtime import ResumeResult, SessionCoordinator
+from kcode.hooks import (
+    HookCatalogBuilder,
+    HookContext,
+    HookEngine,
+    HookEvent,
+    HookTrustStore,
+)
 from kcode.mcp import McpManager
 from kcode.mcp.trust import McpTrustRequest
 from kcode.memory.models import MemoryDecision, MemoryScope, MemoryStatus
@@ -70,6 +77,7 @@ from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry, create_default_registry
 from kcode.ui.approval import ApprovalScreen
 from kcode.ui.command_menu import CommandMenu
+from kcode.ui.hook_trust import HookTrustScreen
 from kcode.ui.mcp_trust import McpTrustScreen
 from kcode.ui.memory import (
     MemoryDeleteScreen,
@@ -150,6 +158,9 @@ class KCodeApp(App[None]):
         memory_coordinator: MemoryCoordinator | None = None,
         skill_builder: SkillCatalogBuilder | None = None,
         skill_trust_store: SkillTrustStore | None = None,
+        hook_builder: HookCatalogBuilder | None = None,
+        hook_trust_store: HookTrustStore | None = None,
+        hook_engine: HookEngine | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -176,6 +187,9 @@ class KCodeApp(App[None]):
         self.mcp_manager = mcp_manager
         self.skill_builder = skill_builder or SkillCatalogBuilder(self.cwd)
         self.skill_trust_store = skill_trust_store or SkillTrustStore()
+        self.hook_builder = hook_builder or HookCatalogBuilder(self.cwd)
+        self.hook_trust_store = hook_trust_store or HookTrustStore()
+        self.hook_engine = hook_engine or HookEngine()
         self.skill_runtime = SkillRuntime()
         if self.registry.get("load_skill") is None:
             self.registry.register(LoadSkillTool(self.skill_runtime))
@@ -203,6 +217,11 @@ class KCodeApp(App[None]):
         if memory_coordinator is not None:
             self.runner.bind_memory(memory_coordinator)
         self.runner.bind_skills(self.skill_runtime)
+        self.runner.bind_hooks(
+            self.hook_engine,
+            coordinator.current if coordinator is not None else None,
+        )
+        self.hook_engine.update_sensitive_values(self.context.sensitive_values)
         self.generating = False
         self._generation_worker: Worker[None] | None = None
         self._active_response: AssistantResponse | None = None
@@ -213,6 +232,9 @@ class KCodeApp(App[None]):
         self._coordinator_closed = False
         self._memory_closed = False
         self._startup_complete = False
+        self._hook_session_ended = False
+        self._hook_shutdown = False
+        self._hook_closed = False
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -242,8 +264,10 @@ class KCodeApp(App[None]):
         self.initialize_mcp()
         if self.memory_coordinator is not None:
             self.monitor_memory()
+        self.monitor_hook_warnings()
 
     async def on_unmount(self) -> None:
+        await self._close_hooks("exit", display=False)
         if self.coordinator is not None and not self._coordinator_closed:
             warnings = await asyncio.shield(self.coordinator.close())
             for warning in warnings:
@@ -257,16 +281,134 @@ class KCodeApp(App[None]):
         if self.mcp_manager is not None:
             await asyncio.shield(self.mcp_manager.close())
 
+    async def _request_hook_trust(self, request) -> bool:
+        return await self.push_screen_wait(HookTrustScreen(request))
+
+    def _hook_context(
+        self,
+        event: HookEvent,
+        *,
+        message: str = "",
+        error: str = "",
+        command: str = "",
+    ) -> HookContext:
+        session_id = (
+            self.coordinator.current.session_id if self.coordinator is not None else "in-memory"
+        )
+        return HookContext(
+            event,
+            session_id,
+            self.cwd,
+            self.session.permission_mode,
+            message=message,
+            error=error,
+            command=command,
+        )
+
+    async def _dispatch_app_hook(
+        self,
+        event: HookEvent,
+        *,
+        message: str = "",
+        error: str = "",
+        command: str = "",
+        display: bool = True,
+    ) -> None:
+        result = await self.hook_engine.run_hooks(
+            self._hook_context(event, message=message, error=error, command=command),
+            self.runner.hook_session,
+        )
+        for warning in result.warnings:
+            if display:
+                await self._append_notice(warning.render(), "system")
+            else:
+                print(f"KCode warning: {warning.render()}", file=sys.stderr)
+
+    async def _end_hook_session(self, reason: str, *, display: bool = True) -> None:
+        if self._hook_session_ended:
+            return
+        await self._dispatch_app_hook(
+            HookEvent.SESSION_END,
+            message=reason,
+            display=display,
+        )
+        self._hook_session_ended = True
+
+    async def _start_hook_session(self, reason: str) -> None:
+        self._hook_session_ended = False
+        await self._dispatch_app_hook(HookEvent.SESSION_START, message=reason)
+
+    async def _close_hooks(self, reason: str, *, display: bool) -> None:
+        if self._hook_closed:
+            return
+        await self._end_hook_session(reason, display=display)
+        if not self._hook_shutdown:
+            await self._dispatch_app_hook(
+                HookEvent.SHUTDOWN,
+                message=reason,
+                display=display,
+            )
+            self._hook_shutdown = True
+        for warning in await self.hook_engine.close():
+            if display:
+                await self._append_notice(warning.render(), "system")
+            else:
+                print(f"KCode warning: {warning.render()}", file=sys.stderr)
+        self._hook_closed = True
+
+    @work(exclusive=True, group="hook-warning-monitor")
+    async def monitor_hook_warnings(self) -> None:
+        while not self._hook_closed:
+            await asyncio.sleep(0.1)
+            for warning in self.hook_engine.runtime.drain_warnings():
+                await self._append_notice(warning.render(), "system")
+
     async def _request_mcp_trust(self, request: McpTrustRequest) -> bool:
         return await self.push_screen_wait(McpTrustScreen(request))
 
     async def _request_skill_trust(self, request) -> bool:
         return await self.push_screen_wait(SkillTrustScreen(request))
 
+    async def _connect_mcp_tools(self) -> str:
+        if self.mcp_manager is None:
+            return "Ready. Ask me anything."
+        try:
+            await self.mcp_manager.prepare(self._request_mcp_trust)
+            summary = await self.mcp_manager.connect_all()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._append_notice(
+                "MCP initialization failed; Skills and Hooks remain available: "
+                f"{exc.__class__.__name__}.",
+                "error",
+            )
+            return "Ready. MCP initialization failed; Skills/Hooks are available."
+        for tool in summary.tools:
+            try:
+                self.registry.register(tool)
+            except ValueError as exc:
+                await self._append_notice(f"KCode ignored an MCP tool: {exc}", "system")
+        self.context = replace(
+            self.context,
+            sensitive_values=tuple(
+                dict.fromkeys((*self.context.sensitive_values, *summary.sensitive_values))
+            ),
+        )
+        self.runner.update_tool_context(self.context)
+        if self.coordinator is not None:
+            self.coordinator.update_sensitive_values(self.context.sensitive_values)
+        if self.memory_coordinator is not None:
+            self.memory_coordinator.update_sensitive_values(self.context.sensitive_values)
+        for warning in summary.warnings:
+            await self._append_notice(warning, "system")
+        return summary.message
+
     @work(exclusive=True, group="mcp-startup")
     async def initialize_mcp(self) -> None:
         prompt = self.query_one("#prompt", Input)
         project_trusted = False
+        project_hooks_trusted = False
         try:
             request, trust_warnings = self.skill_builder.trust_request()
             for warning in trust_warnings:
@@ -284,29 +426,26 @@ class KCodeApp(App[None]):
                                 "无法安全保存项目 Skill 信任；已跳过项目 Skills。",
                                 "error",
                             )
-            ready_message = "Ready. Ask me anything."
-            if self.mcp_manager is not None:
-                await self.mcp_manager.prepare(self._request_mcp_trust)
-                summary = await self.mcp_manager.connect_all()
-                for tool in summary.tools:
-                    try:
-                        self.registry.register(tool)
-                    except ValueError as exc:
-                        await self._append_notice(f"KCode ignored an MCP tool: {exc}", "system")
-                self.context = replace(
-                    self.context,
-                    sensitive_values=tuple(
-                        dict.fromkeys((*self.context.sensitive_values, *summary.sensitive_values))
-                    ),
-                )
-                self.runner.update_tool_context(self.context)
-                if self.coordinator is not None:
-                    self.coordinator.update_sensitive_values(self.context.sensitive_values)
-                if self.memory_coordinator is not None:
-                    self.memory_coordinator.update_sensitive_values(self.context.sensitive_values)
-                for warning in summary.warnings:
-                    await self._append_notice(warning, "system")
-                ready_message = summary.message
+            hook_request, hook_trust_warnings = self.hook_builder.trust_request()
+            for warning in hook_trust_warnings:
+                await self._append_notice(warning.render(), "system")
+            if hook_request is not None:
+                project_hooks_trusted = self.hook_trust_store.is_trusted(hook_request)
+                if not project_hooks_trusted:
+                    project_hooks_trusted = await self._request_hook_trust(hook_request)
+                    if project_hooks_trusted:
+                        try:
+                            await asyncio.to_thread(
+                                self.hook_trust_store.trust,
+                                hook_request,
+                            )
+                        except (OSError, ValueError):
+                            project_hooks_trusted = False
+                            await self._append_notice(
+                                "无法安全保存项目 Hook 信任；已跳过项目 Hooks。",
+                                "error",
+                            )
+            ready_message = await self._connect_mcp_tools()
             catalog = self.skill_builder.build(
                 project_trusted=project_trusted,
                 tool_names=self.registry.names(),
@@ -314,10 +453,16 @@ class KCodeApp(App[None]):
             )
             self.skill_runtime.set_catalog(catalog)
             self.runner.update_available_skills(catalog.available_prompt())
+            hook_catalog = self.hook_builder.build(project_trusted=project_hooks_trusted)
+            self.hook_engine.set_catalog(hook_catalog)
             register_skill_commands(self.command_registry, catalog.summaries())
             self.command_registry.freeze()
             for warning in catalog.warnings:
                 await self._append_notice(warning, "system")
+            for warning in hook_catalog.warnings:
+                await self._append_notice(warning.render(), "system")
+            await self._dispatch_app_hook(HookEvent.STARTUP, message="ready")
+            await self._start_hook_session("initial")
             self.query_one("#ready", Label).update(ready_message)
             self._startup_complete = True
         except asyncio.CancelledError:
@@ -445,6 +590,24 @@ class KCodeApp(App[None]):
     def command_skills(self):
         return self.skill_runtime.catalog.summaries()
 
+    def command_hooks(self):
+        return self.hook_engine.summaries()
+
+    async def command_hook_execute(self, name: str, args: str, command_type) -> None:
+        await self._dispatch_app_hook(
+            HookEvent.COMMAND_EXECUTE,
+            command=name,
+            message=args,
+        )
+
+    async def command_hook_error(self, name: str, error_type: str) -> None:
+        await self._dispatch_app_hook(
+            HookEvent.ERROR,
+            command=name,
+            message="command",
+            error=error_type,
+        )
+
     async def command_execute_skill(self, name: str, args: str) -> None:
         try:
             invocation = self.skill_executor.prepare(name, args)
@@ -509,6 +672,7 @@ class KCodeApp(App[None]):
     async def command_clear(self) -> None:
         clear_warnings: tuple[str, ...] = ()
         skill_warnings: tuple[str, ...] = ()
+        await self._end_hook_session("clear")
         if self.coordinator is None:
             self.conversation.clear()
             await self.runner.clear_context()
@@ -521,6 +685,7 @@ class KCodeApp(App[None]):
         self._iteration = 0
         self._usage = TokenUsage()
         self._session_usage = TokenUsage(0, 0, 0, 0, 0)
+        await self._start_hook_session("clear")
         await self.query_one("#chat", VerticalScroll).remove_children()
         await self._append_notice("当前会话已清空。")
         for warning in clear_warnings:
@@ -534,6 +699,7 @@ class KCodeApp(App[None]):
         self._resume_session()
 
     async def command_exit(self) -> None:
+        await self._close_hooks("exit", display=True)
         if self.coordinator is not None and not self._coordinator_closed:
             for warning in await self.coordinator.close():
                 await self._append_notice(warning, "error")
@@ -729,16 +895,20 @@ class KCodeApp(App[None]):
             if selected is None:
                 return
             self._set_agent_status("恢复会话")
+            await self._end_hook_session("resume")
             result = await self.coordinator.resume(
                 selected,
                 tools=self.runner.tool_definitions(self.session.permission_mode),
             )
             skill_warnings = self.runner.bind_session(result.runtime)
             self.conversation = result.runtime.conversation
+            await self._start_hook_session("resume")
             await self._redraw_resumed_session(result)
             for warning in skill_warnings:
                 await self._append_notice(warning, "system")
         except Exception as exc:
+            if self._hook_session_ended:
+                await self._start_hook_session("resume-failed")
             await self._append_notice(f"恢复会话失败：{exc}", "error")
         finally:
             self._set_agent_status()

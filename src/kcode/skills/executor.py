@@ -77,6 +77,8 @@ class SkillExecutor:
             parent.config,
         )
         child.bind_skills(child_runtime)
+        if parent.hook_engine is not None:
+            child.bind_hooks(parent.hook_engine, parent.hook_session)
         child_session = AgentSession(
             session.permission_mode,
             initial_mode=session.initial_mode,

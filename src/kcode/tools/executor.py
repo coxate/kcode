@@ -31,6 +31,7 @@ from kcode.tools.base import (
     ToolError,
     ToolExecutionError,
     ToolResult,
+    ValidatedToolCall,
 )
 from kcode.tools.registry import ToolRegistry
 
@@ -81,15 +82,10 @@ class ToolExecutor:
         self.permissions = permissions
         self.local_store = local_store
 
-    def prepare(
-        self,
-        call: ToolCall,
-        context: ToolContext,
-        mode: PermissionMode = PermissionMode.DEFAULT,
-    ) -> PreparedToolCall:
+    def validate(self, call: ToolCall) -> ValidatedToolCall:
         tool = self.registry.get(call.name)
         if tool is None:
-            return PreparedToolCall(
+            return ValidatedToolCall(
                 call,
                 None,
                 None,
@@ -103,7 +99,7 @@ class ToolExecutor:
             if not isinstance(raw, dict):
                 raise ValueError("Arguments must be a JSON object.")
         except (json.JSONDecodeError, ValueError) as exc:
-            return PreparedToolCall(
+            return ValidatedToolCall(
                 call,
                 tool,
                 None,
@@ -115,7 +111,7 @@ class ToolExecutor:
         try:
             arguments = tool.spec.arguments_model.model_validate(raw)
         except ValidationError as exc:
-            return PreparedToolCall(
+            return ValidatedToolCall(
                 call,
                 tool,
                 None,
@@ -126,8 +122,33 @@ class ToolExecutor:
                     details={"errors": json.loads(exc.json())},
                 ),
             )
+        return ValidatedToolCall(
+            call,
+            tool,
+            arguments,
+            tool.spec.effect or ToolEffect.SIDE_EFFECT,
+        )
+
+    def authorize(
+        self,
+        validated: ValidatedToolCall,
+        context: ToolContext,
+        mode: PermissionMode = PermissionMode.DEFAULT,
+    ) -> PreparedToolCall:
+        if validated.error is not None:
+            return PreparedToolCall(
+                validated.call,
+                validated.tool,
+                validated.arguments,
+                validated.declared_effect,
+                error=validated.error,
+            )
+        assert validated.tool is not None and validated.arguments is not None
+        call = validated.call
+        tool = validated.tool
+        arguments = validated.arguments
+        declared_effect = validated.declared_effect
         try:
-            declared_effect = tool.spec.effect or ToolEffect.SIDE_EFFECT
             effect = self.permissions.effect_for(call, arguments, mode, declared_effect)
             decision = self.permissions.evaluate(call, arguments, context, mode, declared_effect)
             if decision.verdict == PermissionVerdict.DENY:
@@ -187,6 +208,34 @@ class ToolExecutor:
                     "execution_failed", f"Cannot prepare tool call: {exc.__class__.__name__}: {exc}"
                 ),
             )
+
+    def rejected(
+        self,
+        validated: ValidatedToolCall,
+        *,
+        hook_id: str,
+        reason: str,
+    ) -> PreparedToolCall:
+        return PreparedToolCall(
+            validated.call,
+            validated.tool,
+            validated.arguments,
+            validated.declared_effect,
+            error=ToolResult.failure(
+                "hook_rejected",
+                f"[hook {hook_id}] {reason}",
+                status="denied",
+                details={"tool": validated.call.name, "hook_id": hook_id},
+            ),
+        )
+
+    def prepare(
+        self,
+        call: ToolCall,
+        context: ToolContext,
+        mode: PermissionMode = PermissionMode.DEFAULT,
+    ) -> PreparedToolCall:
+        return self.authorize(self.validate(call), context, mode)
 
     async def execute_prepared(
         self,

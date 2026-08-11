@@ -1,8 +1,12 @@
 import json
+from pathlib import Path
 
-from kcode.conversation import Conversation, ToolResultMessage
+from kcode.conversation import Conversation, SystemReminderMessage, ToolResultMessage
 from kcode.errors import ProviderError, ProviderErrorKind
 from kcode.events import AgentStopped, AgentStopReason, StreamCompleted, TextDelta, ToolCallDelta
+from kcode.hooks.engine import HookEngine
+from kcode.hooks.models import HookCatalog, HookSource
+from kcode.hooks.parser import parse_hook
 from kcode.orchestration import AgentRunner
 from kcode.permissions import (
     LocalPermissionStore,
@@ -116,12 +120,28 @@ async def test_prompt_too_long_runs_one_emergency_compaction_and_one_retry(tmp_p
     provider = EmergencyProvider()
     conversation = Conversation()
     runner = make_runner(tmp_path, provider, conversation)
+    hook, warning = parse_hook(
+        {
+            "id": "after-compact",
+            "event": "compact",
+            "action": {"type": "prompt", "message": "inspect the compacted context"},
+        },
+        HookSource.USER,
+        Path("hooks.yaml"),
+        0,
+    )
+    assert warning is None and hook is not None
+    runner.bind_hooks(HookEngine(HookCatalog((hook,))))
 
     events = [event async for event in runner.run("continue")]
 
     assert len(provider.requests) == 3
     assert provider.requests[1][1:] == ((), "none")
     assert provider.requests[0][1] == provider.requests[2][1]
+    reminders = [
+        item for item in provider.requests[2][0] if isinstance(item, SystemReminderMessage)
+    ]
+    assert [item.content for item in reminders] == ["inspect the compacted context"]
     assert provider.normal_requests == 2
     assert conversation.snapshot()[0].assistant == "recovered"
     assert events[-1] == AgentStopped(AgentStopReason.COMPLETED, 1, "")

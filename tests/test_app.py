@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 from textual.widgets import Collapsible, Input, Markdown, Static
 
-from kcode.conversation import Conversation, EnvironmentMessage, StableSystemMessage
+from kcode.conversation import (
+    Conversation,
+    EnvironmentMessage,
+    StableSystemMessage,
+    SystemReminderMessage,
+)
 from kcode.errors import ProviderError, ProviderErrorKind
 from kcode.events import (
     StreamCompleted,
@@ -15,11 +20,14 @@ from kcode.events import (
     ToolCallDelta,
     UsageReported,
 )
+from kcode.hooks.catalog import HookCatalogBuilder
+from kcode.hooks.trust import HookTrustStore
 from kcode.permissions.models import PermissionMode
 from kcode.session import AgentMode, AgentSession
 from kcode.skills.trust import SkillTrustStore
 from kcode.ui.app import KCodeApp
 from kcode.ui.approval import ApprovalScreen
+from kcode.ui.hook_trust import HookTrustScreen
 from kcode.ui.skill_trust import SkillTrustScreen
 from kcode.ui.widgets import AssistantResponse, ChatMessageWidget, ToolCallWidget
 
@@ -337,7 +345,7 @@ async def test_default_skill_commands_and_prompt_are_registered_after_startup() 
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app.command_registry.frozen
-        assert len(app.command_registry.visible_commands()) == 16
+        assert len(app.command_registry.visible_commands()) == 17
         assert [item.name for item in app.command_skills()] == ["commit", "review", "test"]
         await submit(app, pilot, "/commit explain intent")
         await pilot.pause(0.05)
@@ -371,6 +379,49 @@ async def test_project_skill_trust_blocks_input_and_does_not_show_body(tmp_path:
         await pilot.pause()
         assert not app.query_one("#prompt", Input).disabled
         assert app.command_registry.resolve("project-check") is not None
+
+
+async def test_project_hook_trust_hides_actions_and_startup_prompt_reaches_model(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / ".kcode" / "hooks.yaml"
+    config.parent.mkdir(parents=True)
+    secret_body = "PRIVATE HOOK PROMPT"
+    config.write_text(
+        "hooks:\n"
+        "  - id: context\n"
+        "    event: session_start\n"
+        f"    action: {{type: prompt, message: {secret_body!r}}}\n",
+        encoding="utf-8",
+    )
+    provider = FakeProvider([TextDelta("done"), StreamCompleted("stop")])
+    builder = HookCatalogBuilder(tmp_path, user_path=tmp_path / "missing.yaml")
+    store = HookTrustStore(tmp_path / "trust" / "hooks.json")
+    app = KCodeApp(
+        provider,
+        cwd=tmp_path,
+        hook_builder=builder,
+        hook_trust_store=store,
+    )
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        assert isinstance(app.screen, HookTrustScreen)
+        assert app.query_one("#prompt", Input).disabled
+        summary = str(app.screen.query_one("#hook-trust-summary", Static).content)
+        assert "context" in summary
+        assert secret_body not in summary
+        await pilot.press("1")
+        await pilot.pause()
+        assert not app.query_one("#prompt", Input).disabled
+        assert [item.id for item in app.command_hooks()] == ["context"]
+        await submit(app, pilot, "hello")
+        await pilot.pause(0.05)
+        reminder = next(
+            item
+            for item in provider.requests[0]
+            if isinstance(item, SystemReminderMessage) and item.kind == "hook"
+        )
+        assert reminder.content == secret_body
 
 
 async def test_openai_thinking_warning_is_shown_without_a_request() -> None:

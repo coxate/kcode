@@ -129,6 +129,27 @@ async def _skill(context: CommandContext) -> None:
     )
 
 
+async def _hooks(context: CommandContext) -> None:
+    hooks = context.host.command_hooks()
+    if not hooks:
+        await context.host.command_notice("No hooks loaded.")
+        return
+    lines = ["Loaded Hooks："]
+    for item in hooks:
+        flags = []
+        if item.once:
+            flags.append("once")
+        if item.run_async:
+            flags.append("async")
+        if item.reject:
+            flags.append("reject")
+        suffix = f" [{', '.join(flags)}]" if flags else ""
+        lines.append(
+            f"{item.event.value}  {item.id}  {item.action_type}{suffix}  ({item.source.value})"
+        )
+    await context.host.command_notice("\n".join(lines))
+
+
 def register_skill_commands(registry: CommandRegistry, skills) -> None:
     for skill in skills:
 
@@ -263,6 +284,16 @@ def create_builtin_registry(*, freeze: bool = True) -> CommandRegistry:
             ArgumentPolicy.NONE,
             None,
             _skill,
+        ),
+        (
+            "hooks",
+            (),
+            "查看已加载的 Hook",
+            "/hooks",
+            CommandType.LOCAL,
+            ArgumentPolicy.NONE,
+            None,
+            _hooks,
         ),
     )
     for name, aliases, description, usage, kind, policy, hint, handler in definitions:

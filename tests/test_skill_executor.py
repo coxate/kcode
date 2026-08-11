@@ -1,7 +1,12 @@
 import asyncio
 from pathlib import Path
 
-from kcode.conversation import AssistantMessage, Conversation, ToolResultMessage
+from kcode.conversation import (
+    AssistantMessage,
+    Conversation,
+    SystemReminderMessage,
+    ToolResultMessage,
+)
 from kcode.errors import ProviderError, ProviderErrorKind
 from kcode.events import (
     AgentStopped,
@@ -11,6 +16,10 @@ from kcode.events import (
     TokenUsage,
     UsageReported,
 )
+from kcode.hooks.engine import HookEngine
+from kcode.hooks.models import HookCatalog, HookSource
+from kcode.hooks.parser import parse_hook
+from kcode.hooks.runtime import InMemoryHookSession
 from kcode.orchestration import AgentRunner
 from kcode.permissions import LocalPermissionStore, PermissionEngine, empty_permission_settings
 from kcode.session import AgentSession
@@ -172,3 +181,38 @@ async def test_fork_cancel_does_not_write_main_history(tmp_path: Path) -> None:
     executor.cancel()
     await task
     assert conversation.snapshot() == ()
+
+
+async def test_fork_shares_parent_hook_once_state(tmp_path: Path) -> None:
+    provider = Provider()
+    conversation = Conversation()
+    parent, runtime = parent_runner(tmp_path, provider, conversation)
+    hook, warning = parse_hook(
+        {
+            "id": "fork-context",
+            "event": "turn_start",
+            "once": True,
+            "action": {"type": "prompt", "message": "shared once context"},
+        },
+        HookSource.USER,
+        tmp_path / "hooks.yaml",
+        0,
+    )
+    assert warning is None and hook is not None
+    hook_session = InMemoryHookSession()
+    parent.bind_hooks(HookEngine(HookCatalog((hook,))), hook_session)
+    executor = SkillExecutor(runtime)
+
+    for argument in ("first", "second"):
+        invocation = executor.prepare("review", argument)
+        [event async for event in executor.run_fork(invocation, parent, AgentSession())]
+
+    first_reminders = [
+        item for item in provider.requests[0][0] if isinstance(item, SystemReminderMessage)
+    ]
+    second_reminders = [
+        item for item in provider.requests[1][0] if isinstance(item, SystemReminderMessage)
+    ]
+    assert [item.content for item in first_reminders] == ["shared once context"]
+    assert second_reminders == []
+    assert hook_session.executed_hook_ids == {"fork-context"}

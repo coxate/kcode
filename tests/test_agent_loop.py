@@ -22,6 +22,9 @@ from kcode.events import (
     ToolFinished,
     UsageReported,
 )
+from kcode.hooks.engine import HookEngine
+from kcode.hooks.models import HookCatalog, HookSource
+from kcode.hooks.parser import parse_hook
 from kcode.orchestration import AgentRunner
 from kcode.permissions import (
     LocalPermissionStore,
@@ -89,6 +92,106 @@ def make_runner(tmp_path, provider, *, config=None, conversation=None, environme
         config,
         environment_collector=environment_collector or FakeEnvironmentCollector(),
     )
+
+
+def make_hook(value, order=0):
+    hook, warning = parse_hook(value, HookSource.USER, Path("hooks.yaml"), order)
+    assert warning is None and hook is not None
+    return hook
+
+
+async def test_hook_rejects_before_permission_and_returns_reason_to_model(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            [
+                ToolCallDelta(
+                    0,
+                    "write-1",
+                    "write_file",
+                    '{"path":"protected.txt","content":"unsafe"}',
+                ),
+                StreamCompleted("tool_calls"),
+            ],
+            [TextDelta("used another strategy"), StreamCompleted("stop")],
+        ]
+    )
+    runner = make_runner(tmp_path, provider)
+    engine = HookEngine(
+        HookCatalog(
+            (
+                make_hook(
+                    {
+                        "id": "protect",
+                        "event": "pre_tool_use",
+                        "if": 'args.path == "protected.txt"',
+                        "reject": True,
+                        "reason": "protected path",
+                    }
+                ),
+                make_hook(
+                    {
+                        "id": "observe-denial",
+                        "event": "post_tool_use",
+                        "action": {"type": "prompt", "message": "tool result: $ERROR"},
+                    },
+                    1,
+                ),
+            )
+        )
+    )
+    runner.bind_hooks(engine)
+
+    events = [event async for event in runner.run("write it")]
+
+    assert not (tmp_path / "protected.txt").exists()
+    assert not any(isinstance(event, ApprovalPending) for event in events)
+    result = next(item for item in provider.requests[1][0] if isinstance(item, ToolResultMessage))
+    assert result.result.error is not None
+    assert result.result.error.code == "hook_rejected"
+    assert "protected path" in result.result.error.message
+    reminder = next(
+        item
+        for item in provider.requests[1][0]
+        if isinstance(item, SystemReminderMessage) and item.kind == "hook"
+    )
+    assert "protected path" in reminder.content
+
+
+async def test_hook_prompt_timing_and_turn_end_queue(tmp_path) -> None:
+    provider = ScriptedProvider([[TextDelta("done"), StreamCompleted("stop")]])
+    runner = make_runner(tmp_path, provider)
+    engine = HookEngine(
+        HookCatalog(
+            (
+                make_hook(
+                    {
+                        "id": "before-send",
+                        "event": "pre_send",
+                        "action": {"type": "prompt", "message": "before request"},
+                    }
+                ),
+                make_hook(
+                    {
+                        "id": "after-turn",
+                        "event": "turn_end",
+                        "action": {"type": "prompt", "message": "next turn"},
+                    },
+                    1,
+                ),
+            )
+        )
+    )
+    runner.bind_hooks(engine)
+
+    [event async for event in runner.run("hello")]
+
+    reminder = next(
+        item
+        for item in provider.requests[0][0]
+        if isinstance(item, SystemReminderMessage) and item.kind == "hook"
+    )
+    assert reminder.content == "before request"
+    assert engine.runtime.fallback_session.pending_hook_prompts == ["next turn"]
 
 
 async def test_load_skill_is_visible_in_plan_and_updates_next_iteration_environment(
