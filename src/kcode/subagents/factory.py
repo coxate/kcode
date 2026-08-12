@@ -10,7 +10,12 @@ from kcode.permissions.models import PermissionMode
 from kcode.session import AgentSession
 from kcode.skills.runtime import SkillRuntime
 from kcode.skills.tools import LoadSkillTool
-from kcode.subagents.filter import defined_registry, fork_registry, skill_fork_registry
+from kcode.subagents.filter import (
+    defined_registry,
+    fork_registry,
+    skill_fork_registry,
+    team_member_registry,
+)
 from kcode.subagents.models import AgentDefinition, restricted_mode
 from kcode.subagents.provider import ProviderPool
 from kcode.tools.base import ApprovalHandler, ToolContext
@@ -120,6 +125,44 @@ class SubAgentFactory:
             AgentSession(parent_mode),
             parent_mode,
         )
+
+    def team_member(
+        self,
+        definition: AgentDefinition,
+        parent: AgentRunner,
+        parent_mode: PermissionMode,
+        approve: ApprovalHandler,
+        *,
+        context: ToolContext,
+        collaboration_tools: tuple,
+        message_source,
+        team_notice: str,
+        worktree_notice: str = "",
+    ) -> ChildAgent:
+        child = self.defined(
+            definition,
+            parent,
+            parent_mode,
+            approve,
+            background=True,
+            context=context,
+            worktree_notice=worktree_notice,
+        )
+        registry = team_member_registry(parent.registry, definition.meta, collaboration_tools)
+        runtime = child.runner.skill_runtime
+        if runtime is not None:
+            self._register_load_skill(parent, registry, runtime)
+        child.runner.registry = registry
+        child.runner.executor.registry = registry
+        child.runner.scheduler.executor.registry = registry
+        child.runner.prompt_builder = child.runner.prompt_builder.with_appended_content(
+            "custom_instructions", team_notice
+        )
+        child.runner._stable_system = child.runner._stable_system.__class__(
+            child.runner.prompt_builder.build()
+        )
+        child.runner.bind_team_messages(message_source)
+        return child
 
     def skill_fork(
         self,

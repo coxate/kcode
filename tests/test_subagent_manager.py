@@ -10,6 +10,7 @@ from kcode.session import AgentSession
 from kcode.subagents.approval import ApprovalBroker
 from kcode.subagents.factory import ChildAgent
 from kcode.subagents.manager import TaskFinalization, TaskManager
+from kcode.subagents.models import TaskKind
 from kcode.tools.base import ApprovalRequest
 
 
@@ -260,3 +261,77 @@ def test_tiny_truncation_budget_is_bounded() -> None:
     from kcode.subagents.manager import _truncate
 
     assert len(_truncate("long-value", 4).encode("utf-8")) <= 4
+
+
+async def test_team_member_completion_is_retained_and_hidden() -> None:
+    finalized = 0
+    completed = 0
+
+    async def finalize(_record):
+        nonlocal finalized
+        finalized += 1
+        return TaskFinalization("final", details={"kept": True})
+
+    async def on_complete(_record):
+        nonlocal completed
+        completed += 1
+
+    manager = TaskManager(SubAgentConfig(), ApprovalBroker(allow))
+    launched = await manager.launch(
+        child(),
+        "first",
+        "alice",
+        background=True,
+        kind=TaskKind.TEAM_MEMBER,
+        retain_on_success=True,
+        pinned=True,
+        finalizer=finalize,
+        completion_callback=on_complete,
+    )
+    record = manager.get(launched.task_id, TaskKind.TEAM_MEMBER)
+    assert record is not None
+    await record.task
+    assert record.status.value == "completed"
+    assert completed == 1
+    assert finalized == 0
+    assert manager.get(record.id) is None
+    assert manager.summaries() == ()
+    assert not manager.stop(record.id)
+
+    await manager.resume_retained(record.id, "second", expected_kind=TaskKind.TEAM_MEMBER)
+    await record.task
+    assert len(record.child.conversation.snapshot()) == 2
+    assert record.usage.total_tokens == 10
+    assert completed == 2
+    assert finalized == 0
+
+    finalized_record = await manager.finalize_retained(
+        record.id, expected_kind=TaskKind.TEAM_MEMBER
+    )
+    assert finalized_record.finalization_details == {"kept": True}
+    assert finalized == 1
+    assert manager.release(record.id, expected_kind=TaskKind.TEAM_MEMBER)
+    await manager.close()
+
+
+async def test_pinned_terminal_record_is_not_evicted() -> None:
+    manager = TaskManager(SubAgentConfig(max_running=2, max_retained=2), ApprovalBroker(allow))
+    team = await manager.launch(
+        child(),
+        "team",
+        "alice",
+        background=True,
+        kind=TaskKind.TEAM_MEMBER,
+        retain_on_success=True,
+        pinned=True,
+    )
+    team_record = manager.get(team.task_id, TaskKind.TEAM_MEMBER)
+    await team_record.task
+    normal = await manager.launch(child(), "normal", "worker", background=True)
+    normal_record = manager.get(normal.task_id)
+    await normal_record.task
+    replacement = await manager.launch(child(), "new", "new-worker", background=True)
+    assert manager.get(team.task_id, TaskKind.TEAM_MEMBER) is team_record
+    assert manager.get(normal.task_id) is None
+    await manager.get(replacement.task_id).task
+    await manager.close()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
 from kcode.config import SubAgentConfig
@@ -15,8 +15,8 @@ from kcode.events import (
 )
 from kcode.subagents.approval import ApprovalBroker
 from kcode.subagents.factory import ChildAgent
-from kcode.subagents.models import TaskNotification, TaskStatus
-from kcode.tools.base import ApprovalRequest
+from kcode.subagents.models import TaskKind, TaskNotification, TaskStatus
+from kcode.tools.base import ApprovalRequest, JSONValue
 
 MAX_RESULT_BYTES = 32 * 1024
 TERMINAL_STATUSES = {
@@ -55,6 +55,11 @@ class TaskRecord:
     finalizer: TaskFinalizer | None = None
     finalizer_consumed: bool = False
     warnings: tuple[str, ...] = ()
+    kind: TaskKind = TaskKind.SUBAGENT
+    retain_on_success: bool = False
+    pinned: bool = False
+    completion_callback: TaskCompletionCallback | None = None
+    finalization_details: Mapping[str, JSONValue] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,9 +74,11 @@ class LaunchResult:
 class TaskFinalization:
     suffix: str = ""
     warnings: tuple[str, ...] = ()
+    details: Mapping[str, JSONValue] = field(default_factory=dict)
 
 
 TaskFinalizer = Callable[[TaskRecord], Awaitable[TaskFinalization]]
+TaskCompletionCallback = Callable[[TaskRecord], Awaitable[None]]
 
 
 class TaskManager:
@@ -120,7 +127,11 @@ class TaskManager:
         if len(self._records) < self.config.max_retained:
             return
         ended = sorted(
-            (item for item in self._records.values() if item.status in TERMINAL_STATUSES),
+            (
+                item
+                for item in self._records.values()
+                if item.status in TERMINAL_STATUSES and not item.pinned
+            ),
             key=lambda item: item.created_at,
         )
         if not ended:
@@ -139,6 +150,10 @@ class TaskManager:
         background: bool,
         task_id: str | None = None,
         finalizer: TaskFinalizer | None = None,
+        kind: TaskKind = TaskKind.SUBAGENT,
+        retain_on_success: bool = False,
+        pinned: bool = False,
+        completion_callback: TaskCompletionCallback | None = None,
     ) -> TaskRecord:
         if self._closed:
             raise RuntimeError("SubAgent task manager is closed.")
@@ -155,6 +170,10 @@ class TaskManager:
             prompt,
             background,
             finalizer=finalizer,
+            kind=kind,
+            retain_on_success=retain_on_success,
+            pinned=pinned,
+            completion_callback=completion_callback,
         )
         self._records[record.id] = record
         return record
@@ -178,6 +197,7 @@ class TaskManager:
             *record.warnings,
             *(self._redact(warning) for warning in finalized.warnings),
         )
+        record.finalization_details = finalized.details
         if finalized.suffix:
             if record.result:
                 record.result = self._append_finalization(record.result, finalized.suffix)
@@ -233,9 +253,22 @@ class TaskManager:
             record.status = TaskStatus.FAILED
             record.error = self._redact(f"SubAgent failed ({type(exc).__name__}).")
         finally:
-            await self._finalize(record)
+            if record.status is not TaskStatus.COMPLETED or not record.retain_on_success:
+                await self._finalize(record)
             self.broker.cancel_task(record.id)
-            if record.background or record.detach_event.is_set():
+            if record.completion_callback is not None:
+                try:
+                    await record.completion_callback(record)
+                except asyncio.CancelledError:
+                    record.warnings = (
+                        *record.warnings,
+                        "Task completion callback was interrupted.",
+                    )
+                except Exception:
+                    record.warnings = (*record.warnings, "Task completion callback failed.")
+            if record.kind is TaskKind.SUBAGENT and (
+                record.background or record.detach_event.is_set()
+            ):
                 result = record.result or record.error
                 self._notifications.append(
                     TaskNotification(
@@ -260,6 +293,10 @@ class TaskManager:
         background: bool,
         task_id: str | None = None,
         finalizer: TaskFinalizer | None = None,
+        kind: TaskKind = TaskKind.SUBAGENT,
+        retain_on_success: bool = False,
+        pinned: bool = False,
+        completion_callback: TaskCompletionCallback | None = None,
     ) -> LaunchResult:
         record = self._new_record(
             child,
@@ -268,6 +305,10 @@ class TaskManager:
             background=background,
             task_id=task_id,
             finalizer=finalizer,
+            kind=kind,
+            retain_on_success=retain_on_success,
+            pinned=pinned,
+            completion_callback=completion_callback,
         )
         record.task = asyncio.create_task(self._run(record))
         if background:
@@ -315,7 +356,7 @@ class TaskManager:
         record.detach_event.set()
         return True
 
-    def summaries(self) -> tuple[dict[str, object], ...]:
+    def summaries(self, kind: TaskKind = TaskKind.SUBAGENT) -> tuple[dict[str, object], ...]:
         return tuple(
             {
                 "task_id": item.id,
@@ -324,13 +365,19 @@ class TaskManager:
                 "tokens": item.usage.total_tokens,
             }
             for item in sorted(self._records.values(), key=lambda value: value.created_at)
+            if item.kind is kind
         )
 
-    def get(self, task_id: str) -> TaskRecord | None:
-        return self._records.get(task_id)
-
-    def stop(self, task_id: str) -> bool:
+    def get(
+        self,
+        task_id: str,
+        expected_kind: TaskKind = TaskKind.SUBAGENT,
+    ) -> TaskRecord | None:
         record = self._records.get(task_id)
+        return record if record is not None and record.kind is expected_kind else None
+
+    def stop(self, task_id: str, expected_kind: TaskKind = TaskKind.SUBAGENT) -> bool:
+        record = self.get(task_id, expected_kind)
         if record is None or record.status in TERMINAL_STATUSES:
             return False
         record.child.runner.cancel()
@@ -338,7 +385,16 @@ class TaskManager:
         return True
 
     async def send_message(self, task_id: str, message: str) -> LaunchResult:
-        record = self._records.get(task_id)
+        return await self.resume_retained(task_id, message, expected_kind=TaskKind.SUBAGENT)
+
+    async def resume_retained(
+        self,
+        task_id: str,
+        message: str,
+        *,
+        expected_kind: TaskKind,
+    ) -> LaunchResult:
+        record = self.get(task_id, expected_kind)
         if record is None or record.status is not TaskStatus.COMPLETED:
             raise ValueError("Only a retained completed task can receive another message.")
         if record.finalizer_consumed:
@@ -352,6 +408,56 @@ class TaskManager:
         record.error = ""
         record.task = asyncio.create_task(self._run(record))
         return LaunchResult(record.id, "async_launched", warnings=record.warnings)
+
+    async def wait(
+        self,
+        task_id: str,
+        timeout: float,
+        *,
+        expected_kind: TaskKind,
+    ) -> TaskRecord | None:
+        record = self.get(task_id, expected_kind)
+        if record is None or record.task is None:
+            return record
+        try:
+            await asyncio.wait_for(asyncio.shield(record.task), timeout)
+        except TimeoutError:
+            return record
+        return record
+
+    async def finalize_retained(
+        self,
+        task_id: str,
+        *,
+        expected_kind: TaskKind,
+    ) -> TaskRecord:
+        record = self.get(task_id, expected_kind)
+        if record is None:
+            raise ValueError("Task is missing or belongs to another task category.")
+        if record.status not in TERMINAL_STATUSES:
+            raise ValueError("Only a terminal retained task can be finalized.")
+        await self._finalize(record)
+        return record
+
+    def release(self, task_id: str, *, expected_kind: TaskKind) -> bool:
+        record = self.get(task_id, expected_kind)
+        if record is None or record.status not in TERMINAL_STATUSES:
+            return False
+        if record.task is not None and not record.task.done():
+            return False
+        if record.finalizer is not None and not record.finalizer_consumed:
+            return False
+        self._records.pop(task_id, None)
+        return True
+
+    def can_launch(self) -> bool:
+        if self._closed or self._active_count() >= self.config.max_running:
+            return False
+        if len(self._records) < self.config.max_retained:
+            return True
+        return any(
+            item.status in TERMINAL_STATUSES and not item.pinned for item in self._records.values()
+        )
 
     def take_notifications(self) -> tuple[str, ...]:
         notifications = tuple(self._notifications)
@@ -388,4 +494,7 @@ class TaskManager:
                     task.cancel()
                 if still_pending:
                     await asyncio.gather(*still_pending, return_exceptions=True)
+        for record in tuple(self._records.values()):
+            if record.status in TERMINAL_STATUSES and not record.finalizer_consumed:
+                await self._finalize(record)
         await self.broker.close()

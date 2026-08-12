@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SHA = re.compile(r"^[0-9a-f]{40,64}$")
@@ -102,6 +103,20 @@ class WorktreeFinalizationReport:
     kept: bool
     reason: str
     warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "path": str(self.path),
+            "branch": self.branch,
+            "base_commit": self.base_commit,
+            "head_commit": self.head_commit,
+            "dirty": self.dirty,
+            "head_changed": self.head_changed,
+            "kept": self.kept,
+            "reason": self.reason,
+            "warnings": list(self.warnings),
+        }
 
     def render(self) -> str:
         def known(value: object | None) -> str:

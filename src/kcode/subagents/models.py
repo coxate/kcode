@@ -84,6 +84,11 @@ class TaskStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class TaskKind(StrEnum):
+    SUBAGENT = "subagent"
+    TEAM_MEMBER = "team_member"
+
+
 @dataclass(frozen=True, slots=True)
 class TaskNotification:
     task_id: str

@@ -101,6 +101,10 @@ class TaskNotificationSource(Protocol):
     def take_notifications(self) -> tuple[str, ...]: ...
 
 
+class TeamMessageSource(Protocol):
+    def take_team_messages(self) -> tuple[str, ...]: ...
+
+
 class StreamAccumulator:
     def __init__(self) -> None:
         self.text = ""
@@ -190,6 +194,7 @@ class AgentRunner:
         self._request_seed = tuple(request_seed)
         self._delegation_snapshot: DelegationSnapshot | None = None
         self._task_notifications: TaskNotificationSource | None = None
+        self._team_messages: TeamMessageSource | None = None
         self.is_subagent = is_subagent
 
     def cancel(self) -> None:
@@ -248,6 +253,11 @@ class AgentRunner:
         if self._cancel_event is not None:
             raise RuntimeError("Cannot bind task notifications while the agent is running.")
         self._task_notifications = source
+
+    def bind_team_messages(self, source: TeamMessageSource) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind Team messages while the agent is running.")
+        self._team_messages = source
 
     def update_available_skills(self, content: str) -> None:
         if self._cancel_event is not None:
@@ -561,6 +571,11 @@ class AgentRunner:
                     reminder_items.extend(
                         SystemReminderMessage("task", item)
                         for item in self._task_notifications.take_notifications()
+                    )
+                if self._team_messages is not None:
+                    reminder_items.extend(
+                        SystemReminderMessage("team", item)
+                        for item in self._team_messages.take_team_messages()
                     )
                 reminders = tuple(reminder_items)
                 active_content = (

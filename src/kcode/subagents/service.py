@@ -157,7 +157,7 @@ class SubAgentService:
 
         async def finalize(_task_record) -> TaskFinalization:
             report = await self.worktrees.finalize(record, task_id)
-            return TaskFinalization(report.render(), report.warnings)
+            return TaskFinalization(report.render(), report.warnings, report.to_dict())
 
         try:
             context = replace(

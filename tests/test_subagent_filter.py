@@ -31,3 +31,4 @@ async def test_defined_filter_and_fork_denial() -> None:
     assert result.status == "denied"
     assert result.error.code == "nested_subagent_disabled"
     assert "agent" in CONTROL_TOOL_NAMES
+    assert "team_spawn" in CONTROL_TOOL_NAMES

@@ -10,6 +10,15 @@ CONTROL_TOOL_NAMES = {
     "task_get",
     "task_stop",
     "task_send_message",
+    "team_create",
+    "team_spawn",
+    "team_status",
+    "team_stop",
+    "team_delete",
+    "team_send_message",
+    "team_task_create",
+    "team_task_list",
+    "team_task_update",
 }
 BACKGROUND_BASE_TOOLS = {
     "read_file",
@@ -48,6 +57,17 @@ def defined_registry(parent: ToolRegistry, meta: AgentMeta, *, background: bool)
         name = tool.spec.name
         if name == "load_skill" or name not in allowed:
             continue
+        registry.register(tool)
+    return registry
+
+
+def team_member_registry(
+    parent: ToolRegistry,
+    meta: AgentMeta,
+    collaboration_tools: tuple,
+) -> ToolRegistry:
+    registry = defined_registry(parent, meta, background=True)
+    for tool in collaboration_tools:
         registry.register(tool)
     return registry
 

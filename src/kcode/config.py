@@ -110,6 +110,13 @@ class SubAgentConfig(BaseModel):
         return self
 
 
+class TeamConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+    max_members: int = Field(default=3, ge=1, le=3)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -120,6 +127,8 @@ class AppConfig(BaseModel):
     memory_warnings: tuple[str, ...] = ()
     subagents: SubAgentConfig = SubAgentConfig()
     subagent_warnings: tuple[str, ...] = ()
+    teams: TeamConfig = TeamConfig()
+    team_warnings: tuple[str, ...] = ()
     mcp_servers: tuple[McpServerConfig, ...] = ()
     mcp_warnings: tuple[str, ...] = ()
 
@@ -174,6 +183,9 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     subagents = value.get("subagents", {})
     if not isinstance(subagents, dict):
         raise ConfigError(f"Invalid config {path}, field 'subagents': expected a mapping.")
+    teams = value.get("teams", {})
+    if not isinstance(teams, dict):
+        raise ConfigError(f"Invalid config {path}, field 'teams': expected a mapping.")
     return value
 
 
@@ -189,6 +201,8 @@ def _merge_configs(
     memory_warnings: list[str] = []
     subagents: dict[str, Any] = {}
     subagent_warnings: list[str] = []
+    teams: dict[str, Any] = {}
+    team_warnings: list[str] = []
     for path, raw, source in configs:
         if "active_provider" in raw:
             active = raw["active_provider"]
@@ -218,6 +232,14 @@ def _merge_configs(
                 f"KCode ignored project subagents settings from {path}; "
                 "configure SubAgents in ~/.kcode/config.yaml."
             )
+        raw_teams = raw.get("teams", {})
+        if source == "user":
+            teams.update(raw_teams)
+        elif raw_teams:
+            team_warnings.append(
+                f"KCode ignored project teams settings from {path}; "
+                "enable Agent Teams in ~/.kcode/config.yaml after reviewing parallel Token cost."
+            )
     return {
         "active_provider": active,
         "providers": list(merged.values()),
@@ -226,6 +248,8 @@ def _merge_configs(
         "memory_warnings": memory_warnings,
         "subagents": subagents,
         "subagent_warnings": subagent_warnings,
+        "teams": teams,
+        "team_warnings": team_warnings,
         "mcp_servers": mcp_servers,
         "mcp_warnings": mcp_warnings,
     }
@@ -337,6 +361,8 @@ def load_config(
             memory_warnings=tuple(merged["memory_warnings"]),
             subagents=merged["subagents"],
             subagent_warnings=tuple(merged["subagent_warnings"]),
+            teams=TeamConfig.model_validate(merged["teams"]),
+            team_warnings=tuple(merged["team_warnings"]),
             mcp_servers=tuple(mcp_servers),
             mcp_warnings=tuple(mcp_warnings),
         )
