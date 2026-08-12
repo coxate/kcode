@@ -57,6 +57,22 @@ async def test_tool_uses_bound_caller_and_maps_error() -> None:
     assert result.error.code == "teams_disabled"
 
 
+async def test_all_disabled_tools_return_same_stable_error() -> None:
+    disabled = Manager(TeamError("teams_disabled", "disabled"))
+    context = ToolContext(Path.cwd())
+    for tool in lead_tools(disabled):
+        values = {
+            "team_create": {"name": "core", "goal": "ship"},
+            "team_spawn": {"name": "alice", "prompt": "work"},
+            "team_stop": {"name": "alice"},
+            "team_send_message": {"to": "lead", "message": "hello"},
+            "team_task_create": {"title": "task", "description": "work"},
+            "team_task_update": {"task_id": "team-task-000000000000"},
+        }.get(tool.spec.name, {})
+        result = await tool.execute(tool.spec.arguments_model(**values), context)
+        assert result.error.code == "teams_disabled"
+
+
 def test_registration_schema_does_not_depend_on_state() -> None:
     first = ToolRegistry()
     second = ToolRegistry()
@@ -64,3 +80,15 @@ def test_registration_schema_does_not_depend_on_state() -> None:
     register_team_tools(second, Manager(TeamError("teams_disabled", "disabled")))
     assert first.names() == second.names()
     assert first.definitions() == second.definitions()
+
+
+async def test_tool_result_is_bounded() -> None:
+    class Large(Manager):
+        async def status(self, caller):
+            return TeamOperationResult({"value": "x" * (40 * 1024)})
+
+    tool = next(item for item in lead_tools(Large()) if item.spec.name == "team_status")
+    result = await tool.execute(tool.spec.arguments_model(), ToolContext(Path.cwd()))
+    assert result.truncated
+    assert result.data["truncated"] is True
+    assert len(result.to_json().encode("utf-8")) <= 33 * 1024

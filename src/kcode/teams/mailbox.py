@@ -4,6 +4,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
+from html import escape
 
 from kcode.teams.models import TeamError, TeamMessage
 from kcode.teams.rendering import MAX_TEAM_BYTES, redact
@@ -88,7 +89,7 @@ class TeamMessageSource:
                 (
                     f'<message sequence="{item.sequence}" from="{item.sender}" '
                     f'to="{item.recipient}" created_at="{item.created_at}">',
-                    item.body,
+                    escape(item.body),
                     "</message>",
                 )
             )

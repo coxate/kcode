@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from kcode import __version__
 from kcode.commands import CommandRegistrationError, create_builtin_registry
 from kcode.config import default_config_paths, load_config
 from kcode.conversation import Conversation
@@ -27,6 +28,9 @@ from kcode.worktrees import WorktreeManager
 
 
 def main() -> int:
+    if any(argument in {"--version", "-V"} for argument in sys.argv[1:]):
+        print(__version__)
+        return 0
     try:
         user_path, project_path = default_config_paths(Path.cwd())
         config = load_config(user_path, project_path)

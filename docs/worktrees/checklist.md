@@ -55,12 +55,12 @@
 - [ ] **AC12 旧数据兼容：**0.7.0 用户/项目配置、未含 isolation 的 Agent 定义和既有 session 无需迁移即可加载；非 Git 项目普通 SubAgent 仍可运行。（验证：加载旧 fixture 并运行 shared SubAgent）
 - [ ] **稳定 Schema：**未启用 Worktree 的普通请求，基础工具和 Agent/Task 工具名称、参数 schema、注册顺序与基线一致。（验证：与 0.7.0 schema 快照对比）
 - [x] **Worktree 定向测试：**全部 `tests/test_worktree_*.py` 通过。（证据：42 passed）
-- [x] **受影响模块回归：**SubAgent、Hook、Permission、Command、CLI、App、Skill、MCP 和 History 定向测试通过。（证据：已纳入全仓 452 passed）
-- [x] **全仓测试：**全仓 `pytest` 通过，无新增非预期 skip 或 warning。（证据：452 passed, 2 skipped）
-- [x] **静态质量：**lint、格式和补丁空白检查全部通过。（证据：Ruff check、195 files formatted、`git diff --check` 均通过）
-- [x] **构建资源：**wheel 构建成功，包含 `kcode.worktrees`，安装后四个命令与 shared SubAgent 可用。（证据：隔离安装 `kcode-ai==0.7.0`，可导入 Manager 并解析 `/worktree`）
+- [x] **受影响模块回归：**SubAgent、Hook、Permission、Command、CLI、App、Skill、MCP 和 History 定向测试通过。（证据：0.8.0 组合回归 229 passed；全仓 496 passed）
+- [x] **全仓测试：**全仓 `pytest` 通过，无新增非预期 skip 或 warning。（证据：496 passed, 2 个既有 sandbox MCP skip）
+- [x] **静态质量：**lint、格式和补丁空白检查全部通过。（证据：Ruff check、209 files formatted、`git diff --check` 均通过）
+- [x] **构建资源：**wheel 构建成功，包含 `kcode.worktrees`，安装后版本与模块导入可用。（证据：隔离安装 `kcode-ai==0.8.0`，130 个 wheel 文件，Team/Worktree import smoke 通过）
 - [x] **改动范围：**M1 diff 只包含 Worktree 文档、实现、测试和必要接缝，没有 Team、自动合并、环境复制或跨进程后端。（验证：审阅 `git diff --stat` 和 `git diff`）
-- [ ] **0.8.0 集成：**M2 Agent Team 验收完成后，`src/kcode/__init__.py`、`pyproject.toml`、README、配置示例及帮助中的版本/命令信息一致更新为 0.8.0。（验证：版本断言、wheel metadata 和 CLI 启动信息交叉核对）
+- [x] **0.8.0 集成：**M2 Agent Team 实现后，`src/kcode/__init__.py`、`pyproject.toml`、README、配置示例及帮助中的版本/命令信息一致更新为 0.8.0。（证据：CLI `0.8.0`、wheel metadata `0.8.0`、16 条命令测试通过）
 
 ## 端到端场景
 

@@ -2,7 +2,7 @@
 
 KCode 是一个 Python 全屏终端 AI 编程助手。它提供流式 Markdown、多轮会话、ReAct Agent Loop、Plan Mode、Claude extended thinking，以及 Anthropic、OpenAI 和 DeepSeek 三种配置方式。
 
-0.7.0 在六个工具、分层权限、三层项目指令和可恢复会话之上，新增经用户确认的跨会话长期记忆。模型可以在一次请求中连续调用多轮工具；相邻只读工具有界并发，有副作用的工具按顺序串行。
+0.8.0 在 SubAgent 基础上新增 Git Worktree 文件系统隔离与单进程 Agent Team MVP。多个命名成员可以在独立 Conversation 和 Worktree 中协作，通过共享任务板与点对点消息同步；KCode 不会自动提交或合并成果。
 
 每次请求默认最多运行 10 个模型轮次。模型正常完成、达到迭代上限、用户取消、连续请求未知工具或模型流出错时，界面都会显示明确的停止原因。
 
@@ -66,6 +66,16 @@ memory:
 
 项目配置可以关闭长期记忆，但不能替用户开启。
 
+Agent Team 默认关闭。它会让多个成员并行调用模型，成员从 idle 被消息续派时也会产生新的 Token 费用；阅读费用和隔离说明后，只能在用户级配置显式开启：
+
+```yaml
+teams:
+  enabled: true
+  max_members: 3
+```
+
+项目配置中的 `teams` 会被整段忽略并显示 warning，不能替用户开启或提高上限。
+
 DeepSeek 使用 OpenAI 兼容协议，因此 `protocol` 保持为 `openai`。Claude 的 `thinking: true` 会开启独立 thinking 区域；该设置对 OpenAI/DeepSeek 会被忽略并显示提示。
 `context_window` 是可选的模型上下文窗口覆盖值；未配置时 KCode 会优先使用已知模型元数据，再使用保守默认值并降低预算估算置信度。
 
@@ -89,7 +99,7 @@ uv run kcode
 uv run python -m kcode
 ```
 
-输入 `/help` 可查看 15 条内置命令。输入 `/` 开头的正式命令前缀时会显示补全菜单：Up/Down 选择、Tab 补全、Enter 执行、ESC 关闭。Shift+Tab 循环切换四档权限模式，Ctrl+M 打开长期记忆面板。模型生成时按 Ctrl+C 只取消当前任务；空闲时按 Ctrl+C 退出。
+输入 `/help` 可查看 16 条内置命令。输入 `/` 开头的正式命令前缀时会显示补全菜单：Up/Down 选择、Tab 补全、Enter 执行、ESC 关闭。Shift+Tab 循环切换四档权限模式，Ctrl+M 打开长期记忆面板。模型生成时按 Ctrl+C 只取消当前任务；空闲时按 Ctrl+C 退出。
 
 ## Git Worktree 隔离
 
@@ -124,6 +134,29 @@ isolation: worktree
 任务结束时，KCode 会报告路径、分支、基线、当前 HEAD、dirty 状态和保留原因。无成果副本会用普通 Git 命令安全清理；存在文件修改、新 commit 或任何无法确认的 Git 状态时一律保留。可以使用报告中的路径和分支人工 review；KCode 不会自动合并成果。
 
 非 Git 项目仍可使用普通 `shared` SubAgent；Worktree 命令或 `isolation: worktree` 会返回明确的不可用错误，不会阻止 KCode 启动。
+
+## Agent Team MVP
+
+Agent Team 只存在于当前 KCode 进程：同一时刻只有一个 Team，最多三个命名成员。KCode 重启后不会恢复 Team、任务板或邮箱；有成果的 Worktree 和分支仍保留，可以通过报告中的路径继续 review。
+
+主 Agent 始终注册九个稳定工具：`team_create`、`team_spawn`、`team_status`、`team_stop`、`team_delete`、`team_send_message`、`team_task_create`、`team_task_list`、`team_task_update`。关闭 Team 时它们返回 `teams_disabled`，不会启动模型或创建 Worktree。
+
+用户可在界面直接干预：
+
+```text
+/team status
+/team stop <member>
+/team delete
+```
+
+- 成员默认使用独立 Worktree。主目录必须干净；非 Git 或只读场景只能显式选择 `shared`，并承担并发写冲突风险。
+- 成员自然完成后进入 idle，保留原 Conversation 和 Worktree；新消息可沿用原上下文续派并产生模型费用。
+- 成员可以单播、广播、向 Lead 发消息，并共享带负责人、状态和无环依赖的任务板。
+- Lead 空闲时收到的消息只保留到下一次用户请求，不自动唤醒模型或产生费用。
+- stop、delete 和退出只清理可证明没有成果的临时 Worktree；修改、新 commit 或 Git 状态未知时一律保留。
+- Team 不自动 commit、merge、cherry-pick、rebase 或解决冲突。人工收敛前应先 review 报告路径，并确认主目录干净。
+
+最小安全流程是：在用户配置开启 Team → 让 Lead 调用 `team_create` 和 `team_spawn` → 用 `/team status` 观察 → 用 `/team stop <member>` 停止成员 → review 保留路径 → 所有成员停止后 `/team delete`。关闭 Team 配置是可撤销的；模型费用和已经写入 Worktree 的成果不会因关闭配置自动撤销或删除。
 
 ## 项目指令
 

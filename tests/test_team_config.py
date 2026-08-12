@@ -48,3 +48,16 @@ def test_invalid_team_config_is_actionable(tmp_path: Path) -> None:
     path.write_text(BASE + "\nteams: nope\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="teams"):
         load_config(path, None, {})
+
+
+def test_invalid_project_team_config_is_ignored(tmp_path: Path) -> None:
+    user = write(tmp_path / "user.yaml", BASE)
+    project = write(tmp_path / "project.yaml", "teams: nope\n")
+    config = load_config(user, project, {})
+    assert config.teams == TeamConfig()
+    assert config.team_warnings
+
+    project.write_text("teams: {}\n", encoding="utf-8")
+    config = load_config(user, project, {})
+    assert config.teams == TeamConfig()
+    assert config.team_warnings

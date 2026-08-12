@@ -32,3 +32,12 @@ async def test_defined_filter_and_fork_denial() -> None:
     assert result.error.code == "nested_subagent_disabled"
     assert "agent" in CONTROL_TOOL_NAMES
     assert "team_spawn" in CONTROL_TOOL_NAMES
+
+    class TeamControl:
+        spec = ToolSpec("team_send_message", "message", ToolArguments)
+
+        async def execute(self, arguments, context):
+            raise AssertionError
+
+    registry.register(TeamControl())
+    assert "team_send_message" not in fork_registry(registry).names()

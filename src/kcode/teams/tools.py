@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from typing import Literal
 
 from pydantic import Field
 
 from kcode.teams.models import TeamCaller, TeamError, TeamTaskStatus
+from kcode.teams.rendering import MAX_TEAM_BYTES, truncate
 from kcode.tools.base import ToolArguments, ToolContext, ToolEffect, ToolResult, ToolSpec
 from kcode.tools.registry import ToolRegistry
 
@@ -66,6 +68,14 @@ class TeamTool:
             result = await getattr(self.manager, self.method)(self.caller, **values)
         except TeamError as exc:
             return ToolResult.failure(exc.code, str(exc))
+        encoded = json.dumps(result.data, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > MAX_TEAM_BYTES:
+            content, _ = truncate(encoded, MAX_TEAM_BYTES - 256)
+            return ToolResult.success(
+                {"truncated": True, "content": content},
+                warnings=result.warnings,
+                truncated=True,
+            )
         return ToolResult.success(result.data, warnings=result.warnings)
 
 

@@ -2,6 +2,15 @@
 
 > 状态：已批准。每一项都通过运行代码或观察真实行为验证，不以阅读实现代替验收；没有证据的项目保持未勾选。
 
+## 0.8.0 自动化验收记录（2026-08-12）
+
+- Team 定向组：`39 passed`；受影响的 Worktree 与 SubAgent 定向组分别为 `42 passed`、`40 passed`。
+- Team/Worktree/SubAgent/Permission/Command/Config/CLI/App/Agent Loop 组合回归：`229 passed`。
+- 全仓：`496 passed, 2 skipped`；两个 skip 均因当前 sandbox 不允许 loopback MCP 测试服务器，并由 `pytest -rs` 复核。
+- 并发生命周期关键组连续运行 5 次通过；真实 Git 测试确认两成员修改同名文件时主目录不变，stop/delete 后成果 Worktree 仍存在。
+- Ruff lint、209 文件格式检查、`git diff --check` 均通过；0.8.0 wheel 含 130 个文件并完成版本与模块导入烟测。
+- 未勾选的真实模型、Textual Pilot 和运行中审批人工 E2E 未执行；它们可能产生 Token 费用或需要交互环境，不以单元测试替代宣称通过。
+
 ## 配置、费用与稳定入口
 
 - [ ] **AC1 默认关闭：**使用不含 `teams` 的旧用户配置启动，九个 `team_*` 工具仍可发现，但每个操作都返回 `teams_disabled`，Provider、SubAgentFactory、TaskManager 和 WorktreeManager 的调用计数均不增加。（验证：配置/工具集成测试比较调用前后计数）
@@ -79,8 +88,8 @@
 - [ ] **AC12 输出保护：**Team 工具、消息、状态和 Worktree报告统一脱敏并限制为 32 KiB，结构化 `truncated`/warning 与 review 尾部一致。（验证：秘密、超长 ASCII/中文输入）
 - [ ] **AC12 关闭时旧行为不变：**Team disabled 或无活跃 Team 时，普通 `/status`、会话存档、长期记忆、Skills、Hooks、MCP 和主 Agent cwd 行为不变。（验证：启用前后旧功能回归快照）
 - [ ] **AC12 文档和版本一致：**README、配置示例、帮助、运行时版本、package metadata 和 wheel 均描述同一套 0.8.0 Team 行为。（验证：构建后自动/人工对照）
-- [ ] **AC13 定向测试：**全部 Team 测试及受影响的 SubAgent、Worktree、Orchestration、Permission、Hook、Command、Config、CLI、App 测试通过，无未解释失败或 skip。（验证：运行定向测试组并记录计数）
-- [ ] **AC13 全仓门禁：**全仓 pytest、Ruff lint、格式检查、wheel 内容检查与 `git diff --check` 均以退出码 0 完成。（验证：保存每条命令和结果）
+- [x] **AC13 定向测试：**全部 Team 测试及受影响的 SubAgent、Worktree、Orchestration、Permission、Hook、Command、Config、CLI、App 测试通过，无未解释失败或 skip。（证据：Team 39、Worktree 42、SubAgent 40；组合回归 229 passed）
+- [x] **AC13 全仓门禁：**全仓 pytest、Ruff lint、格式检查、wheel 内容检查与 `git diff --check` 均以退出码 0 完成。（证据：496 passed, 2 个既有 sandbox MCP skip；Ruff/格式/diff/wheel 均通过）
 
 ## 端到端场景
 

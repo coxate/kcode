@@ -4,12 +4,14 @@ from kcode.subagents.models import AgentMeta
 from kcode.tools.base import ToolArguments, ToolContext, ToolResult
 from kcode.tools.registry import ToolRegistry
 
-CONTROL_TOOL_NAMES = {
+SUBAGENT_CONTROL_TOOL_NAMES = {
     "agent",
     "task_list",
     "task_get",
     "task_stop",
     "task_send_message",
+}
+TEAM_TOOL_NAMES = {
     "team_create",
     "team_spawn",
     "team_status",
@@ -20,6 +22,7 @@ CONTROL_TOOL_NAMES = {
     "team_task_list",
     "team_task_update",
 }
+CONTROL_TOOL_NAMES = SUBAGENT_CONTROL_TOOL_NAMES | TEAM_TOOL_NAMES
 BACKGROUND_BASE_TOOLS = {
     "read_file",
     "write_file",
@@ -76,6 +79,8 @@ def fork_registry(parent: ToolRegistry) -> ToolRegistry:
     registry = ToolRegistry()
     for tool in parent.tools():
         if tool.spec.name == "load_skill":
+            continue
+        if tool.spec.name in TEAM_TOOL_NAMES:
             continue
         registry.register(DeniedControlTool(tool) if tool.spec.name in CONTROL_TOOL_NAMES else tool)
     return registry

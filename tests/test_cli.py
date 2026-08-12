@@ -18,6 +18,17 @@ def test_cli_returns_nonzero_before_tui_when_config_is_missing(
     assert str(missing_project) in error
 
 
+def test_cli_version_does_not_require_config(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli.sys, "argv", ["kcode", "--version"])
+    monkeypatch.setattr(
+        cli,
+        "default_config_paths",
+        lambda _cwd: (_ for _ in ()).throw(AssertionError("config should not load")),
+    )
+    assert cli.main() == 0
+    assert capsys.readouterr().out.strip() == "0.8.0"
+
+
 def test_example_config_is_valid_yaml_and_contains_no_secret(tmp_path: Path) -> None:
     example = Path(__file__).parents[1] / "config.example.yaml"
     raw = yaml.safe_load(example.read_text(encoding="utf-8"))
@@ -34,3 +45,5 @@ def test_example_config_is_valid_yaml_and_contains_no_secret(tmp_path: Path) -> 
         },
     )
     assert set(config.providers) == {"openai", "anthropic", "deepseek"}
+    assert config.teams.enabled is False
+    assert config.teams.max_members == 3

@@ -664,3 +664,31 @@ async def test_task_notification_is_consumed_once_without_entering_history(tmp_p
     assert "task-notification" in reminder.content
     assert source.values == ()
     assert "task-notification" not in repr(conversation.messages_snapshot())
+
+
+async def test_team_message_is_consumed_before_model_without_entering_history(tmp_path) -> None:
+    class Messages:
+        def __init__(self):
+            self.values = ("<team-messages>coordinate</team-messages>",)
+
+        def take_team_messages(self):
+            values = self.values
+            self.values = ()
+            return values
+
+    conversation = Conversation()
+    provider = ScriptedProvider([[TextDelta("acknowledged"), StreamCompleted("stop")]])
+    runner = make_runner(tmp_path, provider, conversation=conversation)
+    source = Messages()
+    runner.bind_team_messages(source)
+
+    [event async for event in runner.run("continue")]
+
+    reminder = next(
+        item
+        for item in provider.requests[0][0]
+        if isinstance(item, SystemReminderMessage) and item.kind == "team"
+    )
+    assert "coordinate" in reminder.content
+    assert source.values == ()
+    assert "team-messages" not in repr(conversation.messages_snapshot())

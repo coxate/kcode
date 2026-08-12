@@ -137,7 +137,7 @@ class AppConfig(BaseModel):
         return self.providers[self.active_provider]
 
 
-def _read_yaml(path: Path) -> dict[str, Any]:
+def _read_yaml(path: Path, *, source: Literal["user", "project"] = "user") -> dict[str, Any]:
     try:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -185,7 +185,15 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         raise ConfigError(f"Invalid config {path}, field 'subagents': expected a mapping.")
     teams = value.get("teams", {})
     if not isinstance(teams, dict):
-        raise ConfigError(f"Invalid config {path}, field 'teams': expected a mapping.")
+        if source == "project":
+            value = dict(value)
+            value["teams"] = {}
+            value["_team_warnings"] = [
+                f"KCode ignored invalid project teams settings from {path}; "
+                "configure Agent Teams in ~/.kcode/config.yaml."
+            ]
+        else:
+            raise ConfigError(f"Invalid config {path}, field 'teams': expected a mapping.")
     return value
 
 
@@ -233,9 +241,10 @@ def _merge_configs(
                 "configure SubAgents in ~/.kcode/config.yaml."
             )
         raw_teams = raw.get("teams", {})
+        team_warnings.extend(raw.get("_team_warnings", ()))
         if source == "user":
             teams.update(raw_teams)
-        elif raw_teams:
+        elif "teams" in raw:
             team_warnings.append(
                 f"KCode ignored project teams settings from {path}; "
                 "enable Agent Teams in ~/.kcode/config.yaml after reviewing parallel Token cost."
@@ -316,7 +325,7 @@ def load_config(
     loaded: list[tuple[Path, dict[str, Any], Literal["user", "project"]]] = []
     for path in candidates:
         source: Literal["user", "project"] = "project" if path == project_path else "user"
-        loaded.append((path, _read_yaml(path), source))
+        loaded.append((path, _read_yaml(path, source=source), source))
     merged = _merge_configs(loaded)
     source_label = " then ".join(str(path) for path in candidates)
     providers: dict[str, ProviderConfig] = {}

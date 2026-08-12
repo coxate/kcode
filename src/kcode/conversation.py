@@ -35,7 +35,7 @@ class EnvironmentMessage:
 
 @dataclass(frozen=True, slots=True)
 class SystemReminderMessage:
-    kind: Literal["plan_mode", "approved_plan", "session_resume", "hook", "task"]
+    kind: Literal["plan_mode", "approved_plan", "session_resume", "hook", "task", "team"]
     content: str
 
     def render(self) -> str:
