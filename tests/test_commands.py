@@ -30,6 +30,7 @@ class FakeHost:
     executed_skills: list[tuple[str, str]] = field(default_factory=list)
     hook_commands: list[tuple[str, str, CommandType]] = field(default_factory=list)
     worktree_commands: list[tuple[str, str | None]] = field(default_factory=list)
+    team_commands: list[tuple[str, str | None]] = field(default_factory=list)
 
     async def command_notice(self, text: str, style: str = "system") -> None:
         self.notices.append((text, style))
@@ -105,6 +106,15 @@ class FakeHost:
     async def command_worktree_remove(self, name: str) -> None:
         self.worktree_commands.append(("remove", name))
 
+    async def command_team_status(self) -> None:
+        self.team_commands.append(("status", None))
+
+    async def command_team_stop(self, name: str) -> None:
+        self.team_commands.append(("stop", name))
+
+    async def command_team_delete(self) -> None:
+        self.team_commands.append(("delete", None))
+
 
 def test_parse_plain_slash_case_and_original_arguments() -> None:
     registry = create_builtin_registry()
@@ -121,7 +131,7 @@ def test_parse_plain_slash_case_and_original_arguments() -> None:
 def test_builtin_commands_aliases_and_candidates() -> None:
     registry = create_builtin_registry()
 
-    assert len(registry.visible_commands()) == 15
+    assert len(registry.visible_commands()) == 16
     assert registry.resolve("H").name == "help"
     assert registry.resolve("?").name == "help"
     assert registry.resolve("C").name == "compact"
@@ -217,7 +227,20 @@ async def test_help_is_sorted_and_old_mcp_syntax_is_unknown() -> None:
     await dispatcher.dispatch("/", host)
     lines = host.notices[-1][0].splitlines()[1:]
     assert lines == sorted(lines)
-    assert len(lines) == 15
+    assert len(lines) == 16
+
+
+@pytest.mark.asyncio
+async def test_team_command_dispatches_strict_subcommands() -> None:
+    registry = create_builtin_registry()
+    host = FakeHost()
+    dispatcher = CommandDispatcher(registry)
+    await dispatcher.dispatch("/team status", host)
+    await dispatcher.dispatch("/team stop alice", host)
+    await dispatcher.dispatch("/team delete", host)
+    assert host.team_commands == [("status", None), ("stop", "alice"), ("delete", None)]
+    await dispatcher.dispatch("/team stop", host)
+    assert host.notices[-1] == ("用法：/team status|stop <member>|delete", "error")
     await dispatcher.dispatch("/help s", host)
     assert "名称：/status" in host.notices[-1][0]
     await dispatcher.dispatch("/mcp trust clear", host)
@@ -290,7 +313,7 @@ async def test_delayed_freeze_registers_dynamic_skills() -> None:
     registry.freeze()
     registry.freeze()
     assert registry.frozen
-    assert len(registry.visible_commands()) == 18
+    assert len(registry.visible_commands()) == 19
     host = FakeHost()
     assert await CommandDispatcher(registry).dispatch("/review 并发 安全", host)
     assert host.executed_skills == [("review", "并发 安全")]

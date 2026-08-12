@@ -172,6 +172,21 @@ async def _worktree(context: CommandContext) -> None:
     await context.host.command_notice(f"用法：{usage}", "error")
 
 
+async def _team(context: CommandContext) -> None:
+    parts = context.args.split()
+    usage = "/team status|stop <member>|delete"
+    if parts == ["status"]:
+        await context.host.command_team_status()
+        return
+    if parts == ["delete"]:
+        await context.host.command_team_delete()
+        return
+    if len(parts) == 2 and parts[0] == "stop":
+        await context.host.command_team_stop(parts[1])
+        return
+    await context.host.command_notice(f"用法：{usage}", "error")
+
+
 def register_skill_commands(registry: CommandRegistry, skills) -> None:
     for skill in skills:
 
@@ -326,6 +341,16 @@ def create_builtin_registry(*, freeze: bool = True) -> CommandRegistry:
             ArgumentPolicy.REQUIRED,
             "子命令 [slug]",
             _worktree,
+        ),
+        (
+            "team",
+            (),
+            "查看或停止 Agent Team",
+            "/team status|stop <member>|delete",
+            CommandType.ACTION,
+            ArgumentPolicy.REQUIRED,
+            "子命令 [member]",
+            _team,
         ),
     )
     for name, aliases, description, usage, kind, policy, hint, handler in definitions:

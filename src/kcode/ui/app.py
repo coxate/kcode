@@ -23,7 +23,7 @@ from kcode.commands import (
     create_builtin_registry,
     register_skill_commands,
 )
-from kcode.config import AgentConfig, ProviderConfig, SubAgentConfig
+from kcode.config import AgentConfig, ProviderConfig, SubAgentConfig, TeamConfig
 from kcode.conversation import AssistantMessage, Conversation, ToolResultMessage, UserMessage
 from kcode.events import (
     AgentPhase,
@@ -83,6 +83,9 @@ from kcode.subagents import (
     register_subagent_tools,
 )
 from kcode.subagents.approval import ApprovalBroker
+from kcode.teams import TeamCaller, TeamError
+from kcode.teams.manager import TeamManager
+from kcode.teams.tools import register_team_tools
 from kcode.tools.base import ApprovalRequest, ToolContext
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry, create_default_registry
@@ -179,6 +182,8 @@ class KCodeApp(App[None]):
         agent_builder: AgentCatalogBuilder | None = None,
         agent_trust_store: AgentTrustStore | None = None,
         worktree_manager: WorktreeManager | None = None,
+        team_config: TeamConfig | None = None,
+        team_manager: TeamManager | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -212,6 +217,7 @@ class KCodeApp(App[None]):
         self.agent_trust_store = agent_trust_store or AgentTrustStore()
         self.subagent_config = subagent_config or SubAgentConfig()
         self.worktree_manager = worktree_manager or WorktreeManager(self.cwd)
+        self.team_config = team_config or TeamConfig()
         self.skill_runtime = SkillRuntime()
         if self.registry.get("load_skill") is None:
             self.registry.register(LoadSkillTool(self.skill_runtime))
@@ -266,6 +272,18 @@ class KCodeApp(App[None]):
             self.worktree_manager,
         )
         register_subagent_tools(self.registry, self.subagent_service)
+        self.team_manager = team_manager or TeamManager(
+            self.team_config,
+            self.subagent_config,
+            AgentCatalog(),
+            self.subagent_factory,
+            self.task_manager,
+            self.runner,
+            self.worktree_manager,
+            sensitive_values=self.context.sensitive_values,
+        )
+        register_team_tools(self.registry, self.team_manager)
+        self.runner.bind_team_messages(self.team_manager.lead_message_source())
         self.runner.bind_task_notifications(self.task_manager)
         self.hook_engine.bind_agent_launcher(self.subagent_service)
         self.skill_executor = SkillExecutor(self.skill_runtime, self.subagent_factory)
@@ -319,6 +337,8 @@ class KCodeApp(App[None]):
         self.monitor_subagent_approvals()
 
     async def on_unmount(self) -> None:
+        for warning in await self.team_manager.close():
+            print(f"KCode warning: {warning}", file=sys.stderr)
         await self.task_manager.close()
         await self._close_hooks("exit", display=False)
         if self.coordinator is not None and not self._coordinator_closed:
@@ -543,6 +563,7 @@ class KCodeApp(App[None]):
                 else AgentCatalog()
             )
             self.subagent_service.set_catalog(agent_catalog)
+            self.team_manager.set_catalog(agent_catalog)
             self.runner.update_available_agents(agent_catalog.available_prompt())
             hook_catalog = self.hook_builder.build(project_trusted=project_hooks_trusted)
             self.hook_engine.set_catalog(hook_catalog)
@@ -822,6 +843,8 @@ class KCodeApp(App[None]):
         self._resume_session()
 
     async def command_exit(self) -> None:
+        for warning in await self.team_manager.close():
+            await self._append_notice(warning, "error")
         await self.task_manager.close()
         await self._close_hooks("exit", display=True)
         if self.coordinator is not None and not self._coordinator_closed:
@@ -953,6 +976,43 @@ class KCodeApp(App[None]):
             await self._append_notice(str(exc), "error")
             return
         await self._append_notice(report.render(), "system" if not report.kept else "error")
+
+    async def command_team_status(self) -> None:
+        try:
+            result = await self.team_manager.status(TeamCaller.lead())
+        except TeamError as exc:
+            await self._append_notice(str(exc), "error")
+            return
+        data = result.data
+        lines = [
+            f"Team：{data['name']}",
+            f"目标：{data['goal']}",
+            f"任务：{data['tasks']}",
+        ]
+        for member in data["members"]:
+            lines.append(
+                f"成员：{member['name']} · {member['status']} · {member['isolation']} · "
+                f"Token {member['tokens']} · Worktree {member['worktree']}"
+            )
+        await self._append_notice("\n".join(lines))
+
+    async def command_team_stop(self, name: str) -> None:
+        try:
+            result = await self.team_manager.stop(TeamCaller.lead(), name)
+        except TeamError as exc:
+            await self._append_notice(str(exc), "error")
+            return
+        await self._append_notice(
+            f"成员 {name}：{result.data['status']}\nWorktree：{result.data.get('worktree')}"
+        )
+
+    async def command_team_delete(self) -> None:
+        try:
+            result = await self.team_manager.delete(TeamCaller.lead())
+        except TeamError as exc:
+            await self._append_notice(str(exc), "error")
+            return
+        await self._append_notice(f"Team 已删除。保留报告：{result.data['worktrees']}")
 
     def _set_generating(self, value: bool) -> None:
         self.generating = value

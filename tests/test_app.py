@@ -345,7 +345,7 @@ async def test_default_skill_commands_and_prompt_are_registered_after_startup() 
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app.command_registry.frozen
-        assert len(app.command_registry.visible_commands()) == 18
+        assert len(app.command_registry.visible_commands()) == 19
         assert [item.name for item in app.command_skills()] == ["commit", "review", "test"]
         await submit(app, pilot, "/commit explain intent")
         await pilot.pause(0.05)
