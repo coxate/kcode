@@ -89,7 +89,41 @@ uv run kcode
 uv run python -m kcode
 ```
 
-输入 `/help` 可查看 13 条内置命令。输入 `/` 开头的正式命令前缀时会显示补全菜单：Up/Down 选择、Tab 补全、Enter 执行、ESC 关闭。Shift+Tab 循环切换四档权限模式，Ctrl+M 打开长期记忆面板。模型生成时按 Ctrl+C 只取消当前任务；空闲时按 Ctrl+C 退出。
+输入 `/help` 可查看 15 条内置命令。输入 `/` 开头的正式命令前缀时会显示补全菜单：Up/Down 选择、Tab 补全、Enter 执行、ESC 关闭。Shift+Tab 循环切换四档权限模式，Ctrl+M 打开长期记忆面板。模型生成时按 Ctrl+C 只取消当前任务；空闲时按 Ctrl+C 退出。
+
+## Git Worktree 隔离
+
+Worktree 功能要求 KCode 从一个非 bare Git 工作树内启动。它为同一仓库创建独立目录与分支，但不会改变主 Agent 的工作目录。默认位置是：
+
+```text
+<仓库父目录>/.kcode-worktrees/<仓库名>/<slug>
+```
+
+手动管理命令：
+
+```text
+/worktree create <slug>
+/worktree list
+/worktree status <slug>
+/worktree remove <slug>
+```
+
+- 名称只能是最长 64 字符的单段小写 slug，例如 `api-review`。
+- 手动创建允许主目录有未提交修改，但副本只包含当前 `HEAD`，KCode 会明确警告。
+- `remove` 仅删除可证明“没有未提交修改且没有基线后 commit”的托管 Worktree，不使用强制删除，也不删除对应分支或有成果的目录。
+- KCode 不提供 `enter/exit`，不会自动提交、合并、cherry-pick、复制 `.env` 或链接依赖目录。
+
+定义式 SubAgent 可以在 Markdown frontmatter 中选择隔离：
+
+```yaml
+isolation: worktree
+```
+
+未配置时默认 `shared`，保持旧角色行为。自动隔离要求主目录完全干净；否则任务在创建副本前拒绝，避免子 Agent 看不到主目录的未提交改动。隔离 Agent 的文件、搜索、命令 cwd、环境信息和权限沙箱都以副本为根，不能访问主目录或其他 Worktree。
+
+任务结束时，KCode 会报告路径、分支、基线、当前 HEAD、dirty 状态和保留原因。无成果副本会用普通 Git 命令安全清理；存在文件修改、新 commit 或任何无法确认的 Git 状态时一律保留。可以使用报告中的路径和分支人工 review；KCode 不会自动合并成果。
+
+非 Git 项目仍可使用普通 `shared` SubAgent；Worktree 命令或 `isolation: worktree` 会返回明确的不可用错误，不会阻止 KCode 启动。
 
 ## 项目指令
 

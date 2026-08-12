@@ -6,9 +6,7 @@ from kcode.memory.prompting import render_prompt
 
 def make_record(index: int, scope: MemoryScope, *, active: bool = True) -> MemoryRecord:
     memory_type = (
-        MemoryType.PROJECT_FACT
-        if scope == MemoryScope.PROJECT
-        else MemoryType.USER_PREFERENCE
+        MemoryType.PROJECT_FACT if scope == MemoryScope.PROJECT else MemoryType.USER_PREFERENCE
     )
     return MemoryRecord(
         id=f"mem_{index:032x}",

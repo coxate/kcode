@@ -92,9 +92,7 @@ async def test_status_edit_delete_and_lock_release(tmp_path: Path) -> None:
     provider = Provider((candidate_json(),))
     coordinator = MemoryCoordinator(tmp_path, provider, home=tmp_path / "home")
     coordinator.start()
-    coordinator.submit_turn(
-        CompletedTurn.create("s", "请记住项目使用 uv", "好的", "default")
-    )
+    coordinator.submit_turn(CompletedTurn.create("s", "请记住项目使用 uv", "好的", "default"))
     await coordinator._queue.join()
     proposal = coordinator.pending()[0]
     await coordinator.apply(MemoryDecision(proposal_id=proposal.id, kind=DecisionKind.APPROVE))
@@ -173,9 +171,7 @@ async def test_pending_candidate_survives_restart(tmp_path: Path) -> None:
     reopened = MemoryCoordinator(tmp_path, Provider(), home=tmp_path / "home")
     reopened.start()
     assert reopened.pending()[0].id == proposal_id
-    await reopened.apply(
-        MemoryDecision(proposal_id=proposal_id, kind=DecisionKind.APPROVE)
-    )
+    await reopened.apply(MemoryDecision(proposal_id=proposal_id, kind=DecisionKind.APPROVE))
     await reopened.close()
 
     new_session = MemoryCoordinator(tmp_path, Provider(), home=tmp_path / "home")
@@ -204,9 +200,7 @@ async def test_invalid_extraction_degrades_without_losing_chat_state(tmp_path: P
         home=tmp_path / "home",
     )
     coordinator.start()
-    coordinator.submit_turn(
-        CompletedTurn.create("s", "please remember this", "okay", "default")
-    )
+    coordinator.submit_turn(CompletedTurn.create("s", "please remember this", "okay", "default"))
     await coordinator._queue.join()
     assert coordinator.pending() == ()
     assert any("extraction failed" in item for item in coordinator.warnings)
@@ -235,9 +229,7 @@ async def test_session_close_triggers_due_governance_and_resets_counter(tmp_path
             )
         )
     coordinator.project_store.save_state(
-        MemoryState(
-            completed_session_ids=("s1", "s2", "s3", "s4")
-        )
+        MemoryState(completed_session_ids=("s1", "s2", "s3", "s4"))
     )
     coordinator._reload(MemoryScope.PROJECT)
     coordinator.submit_turn(CompletedTurn.create("s5", "plain question", "answer", "default"))

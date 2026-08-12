@@ -149,9 +149,9 @@ class MemoryGovernor:
                         reason=item.reason,
                         evidence=item.evidence,
                         source_session_id="governance",
-                        source_turn_hash=__import__("hashlib").sha256(
-                            json.dumps(values, sort_keys=True).encode()
-                        ).hexdigest(),
+                        source_turn_hash=__import__("hashlib")
+                        .sha256(json.dumps(values, sort_keys=True).encode())
+                        .hexdigest(),
                         created_at=now_timestamp(),
                     )
                 )

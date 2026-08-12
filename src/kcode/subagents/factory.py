@@ -13,7 +13,7 @@ from kcode.skills.tools import LoadSkillTool
 from kcode.subagents.filter import defined_registry, fork_registry, skill_fork_registry
 from kcode.subagents.models import AgentDefinition, restricted_mode
 from kcode.subagents.provider import ProviderPool
-from kcode.tools.base import ApprovalHandler
+from kcode.tools.base import ApprovalHandler, ToolContext
 from kcode.tools.executor import ToolExecutor
 
 
@@ -47,6 +47,8 @@ class SubAgentFactory:
         approve: ApprovalHandler,
         *,
         background: bool,
+        context: ToolContext | None = None,
+        worktree_notice: str = "",
     ) -> ChildAgent:
         provider = self.providers.get(definition.meta.model, parent.provider)
         runtime = self._skills(parent)
@@ -63,12 +65,17 @@ class SubAgentFactory:
             "custom_instructions",
             f"## SubAgent Role: {definition.meta.name}\n\n{definition.body}",
         )
+        if worktree_notice:
+            prompt_builder = prompt_builder.with_appended_content(
+                "custom_instructions", worktree_notice
+            )
+        child_context = context or parent.context
         runner = AgentRunner(
             provider,
             conversation,
             registry,
             ToolExecutor(registry, parent.executor.permissions, parent.executor.local_store),
-            parent.context,
+            child_context,
             approve,
             config,
             prompt_builder=prompt_builder,

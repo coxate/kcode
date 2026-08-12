@@ -58,8 +58,7 @@ class MemoryReviewScreen(ModalScreen[MemoryDecision | None]):
                 f"{self.proposal.scope.value}/{self.proposal.type.value}"
             )
             yield Static(
-                f"Reason: {self.proposal.reason}\nEvidence: {self.proposal.evidence}"
-                f"{target_text}",
+                f"Reason: {self.proposal.reason}\nEvidence: {self.proposal.evidence}{target_text}",
                 markup=False,
             )
             yield Input(value=self.proposal.title, id="memory-title", placeholder="Title")

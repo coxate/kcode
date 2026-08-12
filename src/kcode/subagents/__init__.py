@@ -1,6 +1,11 @@
 from kcode.subagents.catalog import AgentCatalog, AgentCatalogBuilder
 from kcode.subagents.factory import SubAgentFactory
-from kcode.subagents.manager import LaunchResult, TaskManager, TaskRecord
+from kcode.subagents.manager import (
+    LaunchResult,
+    TaskFinalization,
+    TaskManager,
+    TaskRecord,
+)
 from kcode.subagents.models import (
     AgentDefinition,
     AgentMeta,
@@ -32,6 +37,7 @@ __all__ = [
     "SubAgentFactory",
     "SubAgentService",
     "TaskManager",
+    "TaskFinalization",
     "TaskNotification",
     "TaskRecord",
     "TaskStatus",

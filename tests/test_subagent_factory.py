@@ -91,6 +91,34 @@ def test_factory_definition_is_isolated_and_restricted(tmp_path: Path) -> None:
     assert "Read only." in child.runner.prompt_builder.build()
 
 
+def test_factory_definition_accepts_worktree_context(tmp_path: Path) -> None:
+    runner, provider = parent(tmp_path)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    definition = AgentDefinition(
+        AgentMeta(name="worker", description="Work", isolation="worktree"),
+        "Work locally.",
+        AgentSource.USER,
+        tmp_path / "worker.md",
+        tmp_path,
+        "digest",
+    )
+    context = ToolContext(worktree, sensitive_values=("secret",))
+    child = SubAgentFactory(ProviderPool(provider, {"main": provider.config})).defined(
+        definition,
+        runner,
+        PermissionMode.DEFAULT,
+        allow,
+        background=False,
+        context=context,
+        worktree_notice="<worktree-context>isolated</worktree-context>",
+    )
+    assert child.runner.context is context
+    assert child.runner.context_manager.artifact_store.workspace_root == worktree
+    assert runner.context.workspace_root == tmp_path
+    assert "<worktree-context>isolated" in child.runner.prompt_builder.build()
+
+
 def test_factory_fork_uses_request_seed_and_control_proxies(tmp_path: Path) -> None:
     runner, provider = parent(tmp_path)
     runner._delegation_snapshot = DelegationSnapshot(

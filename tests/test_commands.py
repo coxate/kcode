@@ -29,6 +29,7 @@ class FakeHost:
     compact_focus: str | None = None
     executed_skills: list[tuple[str, str]] = field(default_factory=list)
     hook_commands: list[tuple[str, str, CommandType]] = field(default_factory=list)
+    worktree_commands: list[tuple[str, str | None]] = field(default_factory=list)
 
     async def command_notice(self, text: str, style: str = "system") -> None:
         self.notices.append((text, style))
@@ -92,6 +93,18 @@ class FakeHost:
     def command_session(self) -> SessionInfo:
         return SessionInfo(False)
 
+    async def command_worktree_create(self, name: str) -> None:
+        self.worktree_commands.append(("create", name))
+
+    async def command_worktree_list(self) -> None:
+        self.worktree_commands.append(("list", None))
+
+    async def command_worktree_status(self, name: str) -> None:
+        self.worktree_commands.append(("status", name))
+
+    async def command_worktree_remove(self, name: str) -> None:
+        self.worktree_commands.append(("remove", name))
+
 
 def test_parse_plain_slash_case_and_original_arguments() -> None:
     registry = create_builtin_registry()
@@ -108,7 +121,7 @@ def test_parse_plain_slash_case_and_original_arguments() -> None:
 def test_builtin_commands_aliases_and_candidates() -> None:
     registry = create_builtin_registry()
 
-    assert len(registry.visible_commands()) == 14
+    assert len(registry.visible_commands()) == 15
     assert registry.resolve("H").name == "help"
     assert registry.resolve("?").name == "help"
     assert registry.resolve("C").name == "compact"
@@ -204,11 +217,35 @@ async def test_help_is_sorted_and_old_mcp_syntax_is_unknown() -> None:
     await dispatcher.dispatch("/", host)
     lines = host.notices[-1][0].splitlines()[1:]
     assert lines == sorted(lines)
-    assert len(lines) == 14
+    assert len(lines) == 15
     await dispatcher.dispatch("/help s", host)
     assert "名称：/status" in host.notices[-1][0]
     await dispatcher.dispatch("/mcp trust clear", host)
     assert "未知命令：/mcp" in host.notices[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_worktree_command_parses_subcommands_strictly() -> None:
+    registry = create_builtin_registry()
+    dispatcher = CommandDispatcher(registry)
+    host = FakeHost()
+    for command in (
+        "/worktree create demo",
+        "/worktree list",
+        "/worktree status demo",
+        "/worktree remove demo",
+    ):
+        await dispatcher.dispatch(command, host)
+    assert host.worktree_commands == [
+        ("create", "demo"),
+        ("list", None),
+        ("status", "demo"),
+        ("remove", "demo"),
+    ]
+    await dispatcher.dispatch("/worktree list extra", host)
+    assert host.notices[-1][1] == "error"
+    await dispatcher.dispatch("/help worktree", host)
+    assert "create|list|status|remove" in host.notices[-1][0]
 
 
 @pytest.mark.asyncio
@@ -253,7 +290,7 @@ async def test_delayed_freeze_registers_dynamic_skills() -> None:
     registry.freeze()
     registry.freeze()
     assert registry.frozen
-    assert len(registry.visible_commands()) == 17
+    assert len(registry.visible_commands()) == 18
     host = FakeHost()
     assert await CommandDispatcher(registry).dispatch("/review 并发 安全", host)
     assert host.executed_skills == [("review", "并发 安全")]

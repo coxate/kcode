@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -28,6 +29,7 @@ class AgentMeta(BaseModel):
     max_turns: int | None = Field(default=None, ge=1, le=100)
     permission_mode: PermissionMode = PermissionMode.DEFAULT
     background: bool = False
+    isolation: Literal["shared", "worktree"] = "shared"
 
     @field_validator("description")
     @classmethod

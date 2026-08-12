@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from kcode.config import SubAgentConfig
 from kcode.conversation import Conversation
 from kcode.events import AgentStopped, AgentStopReason, TokenUsage, TokenUsageUpdated
@@ -7,7 +9,7 @@ from kcode.permissions.models import ApprovalChoice, PermissionMode
 from kcode.session import AgentSession
 from kcode.subagents.approval import ApprovalBroker
 from kcode.subagents.factory import ChildAgent
-from kcode.subagents.manager import TaskManager
+from kcode.subagents.manager import TaskFinalization, TaskManager
 from kcode.tools.base import ApprovalRequest
 
 
@@ -133,3 +135,128 @@ async def test_background_result_is_redacted_and_truncated() -> None:
     assert "[REDACTED]" in record.result
     assert len(record.result.encode("utf-8")) <= 32 * 1024
     await manager.close()
+
+
+async def test_finalizer_runs_once_and_appends_redacted_report() -> None:
+    calls = 0
+
+    async def finalize(_record):
+        nonlocal calls
+        calls += 1
+        return TaskFinalization("report secret-value", ("kept",))
+
+    manager = TaskManager(
+        SubAgentConfig(),
+        ApprovalBroker(allow),
+        sensitive_values=("secret-value",),
+    )
+    launched = await manager.launch(child(), "work", "worker", background=True, finalizer=finalize)
+    record = manager.get(launched.task_id)
+    await record.task
+    assert calls == 1
+    assert "report [REDACTED]" in record.result
+    assert record.warnings == ("kept",)
+    with pytest.raises(ValueError, match="finalized isolated"):
+        await manager.send_message(record.id, "again")
+    await manager.close()
+
+
+async def test_finalizer_failure_keeps_original_status() -> None:
+    async def finalize(_record):
+        raise RuntimeError("private detail")
+
+    manager = TaskManager(SubAgentConfig(), ApprovalBroker(allow))
+    launched = await manager.launch(child(), "work", "worker", background=True, finalizer=finalize)
+    record = manager.get(launched.task_id)
+    await record.task
+    assert record.status.value == "completed"
+    assert "private detail" not in " ".join(record.warnings)
+    assert record.finalizer_consumed
+    await manager.close()
+
+
+async def test_finalizer_runs_for_cancelled_task() -> None:
+    calls = 0
+
+    async def finalize(_record):
+        nonlocal calls
+        calls += 1
+        return TaskFinalization("cancel report")
+
+    gate = asyncio.Event()
+    manager = TaskManager(SubAgentConfig(), ApprovalBroker(allow))
+    launched = await manager.launch(
+        child(gate),
+        "wait",
+        "worker",
+        background=True,
+        finalizer=finalize,
+    )
+    assert manager.stop(launched.task_id)
+    record = manager.get(launched.task_id)
+    await record.task
+    assert record.status.value == "cancelled"
+    assert "cancel report" in record.error
+    assert calls == 1
+    await manager.close()
+
+
+async def test_cancelled_foreground_emits_finalized_notification() -> None:
+    gate = asyncio.Event()
+
+    async def finalize(_record):
+        return TaskFinalization("cancelled worktree report")
+
+    manager = TaskManager(SubAgentConfig(), ApprovalBroker(allow))
+    launching = asyncio.create_task(
+        manager.launch(
+            child(gate),
+            "wait",
+            "worker",
+            background=False,
+            finalizer=finalize,
+        )
+    )
+    await asyncio.sleep(0)
+    launching.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await launching
+    record = next(iter(manager._records.values()))
+    await record.task
+    notification = manager.take_notifications()
+    assert len(notification) == 1
+    assert "cancelled worktree report" in notification[0]
+    await manager.close()
+
+
+async def test_long_result_keeps_finalization_report_at_end() -> None:
+    item = child()
+
+    async def long_run(prompt, session):
+        item.conversation.commit(prompt, "x" * (40 * 1024))
+        yield AgentStopped(AgentStopReason.COMPLETED, 1)
+
+    async def finalize(_record):
+        return TaskFinalization("<worktree-result>\nKept: true\n</worktree-result>")
+
+    item.runner.run = long_run
+    manager = TaskManager(SubAgentConfig(), ApprovalBroker(allow))
+    launched = await manager.launch(
+        item,
+        "work",
+        "worker",
+        background=True,
+        finalizer=finalize,
+    )
+    record = manager.get(launched.task_id)
+    await record.task
+    assert len(record.result.encode("utf-8")) <= 32 * 1024
+    assert record.result.endswith("Kept: true\n</worktree-result>")
+    assert "[truncated]" in record.result
+    await manager.close()
+
+
+def test_tiny_truncation_budget_is_bounded() -> None:
+    from kcode.subagents.manager import _truncate
+
+    assert len(_truncate("long-value", 4).encode("utf-8")) <= 4

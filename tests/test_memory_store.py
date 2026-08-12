@@ -22,9 +22,7 @@ from kcode.memory.paths import MemoryPathError
 def record(scope: MemoryScope = MemoryScope.PROJECT) -> MemoryRecord:
     now = time.time()
     memory_type = (
-        MemoryType.PROJECT_FACT
-        if scope == MemoryScope.PROJECT
-        else MemoryType.USER_PREFERENCE
+        MemoryType.PROJECT_FACT if scope == MemoryScope.PROJECT else MemoryType.USER_PREFERENCE
     )
     return MemoryRecord(
         id="mem_" + "a" * 32,
@@ -44,9 +42,7 @@ def record(scope: MemoryScope = MemoryScope.PROJECT) -> MemoryRecord:
 def proposal(scope: MemoryScope = MemoryScope.PROJECT) -> MemoryProposal:
     values = {"scope": scope.value, "title": "Use uv", "source": "c" * 64}
     memory_type = (
-        MemoryType.PROJECT_FACT
-        if scope == MemoryScope.PROJECT
-        else MemoryType.USER_PREFERENCE
+        MemoryType.PROJECT_FACT if scope == MemoryScope.PROJECT else MemoryType.USER_PREFERENCE
     )
     return MemoryProposal(
         id=proposal_id(values),

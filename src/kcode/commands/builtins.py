@@ -150,6 +150,28 @@ async def _hooks(context: CommandContext) -> None:
     await context.host.command_notice("\n".join(lines))
 
 
+async def _worktree(context: CommandContext) -> None:
+    parts = context.args.split()
+    usage = "/worktree create|list|status|remove [slug]"
+    if not parts:
+        await context.host.command_notice(f"用法：{usage}", "error")
+        return
+    action = parts[0].casefold()
+    if action == "list" and len(parts) == 1:
+        await context.host.command_worktree_list()
+        return
+    if action in {"create", "status", "remove"} and len(parts) == 2:
+        name = parts[1]
+        if action == "create":
+            await context.host.command_worktree_create(name)
+        elif action == "status":
+            await context.host.command_worktree_status(name)
+        else:
+            await context.host.command_worktree_remove(name)
+        return
+    await context.host.command_notice(f"用法：{usage}", "error")
+
+
 def register_skill_commands(registry: CommandRegistry, skills) -> None:
     for skill in skills:
 
@@ -294,6 +316,16 @@ def create_builtin_registry(*, freeze: bool = True) -> CommandRegistry:
             ArgumentPolicy.NONE,
             None,
             _hooks,
+        ),
+        (
+            "worktree",
+            (),
+            "管理 Git Worktree 隔离目录",
+            "/worktree create|list|status|remove [slug]",
+            CommandType.ACTION,
+            ArgumentPolicy.REQUIRED,
+            "子命令 [slug]",
+            _worktree,
         ),
     )
     for name, aliases, description, usage, kind, policy, hint, handler in definitions:

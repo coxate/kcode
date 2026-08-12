@@ -141,9 +141,7 @@ class ContextManager:
             )
             result: CompactionResult | None = None
             if should_attempt:
-                result = await self._compact_locked(
-                    model_messages, tool_tuple, reason, focus=focus
-                )
+                result = await self._compact_locked(model_messages, tool_tuple, reason, focus=focus)
                 if result.success:
                     if reason == "automatic":
                         self._automatic_failures = 0

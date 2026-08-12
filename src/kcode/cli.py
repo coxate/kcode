@@ -23,6 +23,7 @@ from kcode.subagents import AgentCatalogBuilder, AgentTrustStore
 from kcode.tools.base import ToolContext
 from kcode.tools.registry import create_default_registry
 from kcode.ui.app import KCodeApp
+from kcode.worktrees import WorktreeManager
 
 
 def main() -> int:
@@ -123,6 +124,7 @@ def main() -> int:
         subagent_config=config.subagents,
         agent_builder=AgentCatalogBuilder(cwd),
         agent_trust_store=AgentTrustStore(),
+        worktree_manager=WorktreeManager(cwd),
     )
     app.run()
     return 0

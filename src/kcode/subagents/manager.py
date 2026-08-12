@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from kcode.config import SubAgentConfig
 from kcode.events import (
@@ -31,7 +31,10 @@ def _truncate(value: str, limit: int = MAX_RESULT_BYTES) -> str:
     if len(raw) <= limit:
         return value
     suffix = "\n[truncated]"
-    budget = limit - len(suffix.encode("utf-8"))
+    suffix_raw = suffix.encode("utf-8")
+    if limit <= len(suffix_raw):
+        return suffix_raw[:limit].decode("utf-8", errors="ignore")
+    budget = limit - len(suffix_raw)
     return raw[:budget].decode("utf-8", errors="ignore") + suffix
 
 
@@ -49,6 +52,9 @@ class TaskRecord:
     usage: TokenUsage = TokenUsage(0, 0, 0, 0, 0)
     task: asyncio.Task[None] | None = None
     detach_event: asyncio.Event = field(default_factory=asyncio.Event)
+    finalizer: TaskFinalizer | None = None
+    finalizer_consumed: bool = False
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +63,15 @@ class LaunchResult:
     status: str
     result: str = ""
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TaskFinalization:
+    suffix: str = ""
+    warnings: tuple[str, ...] = ()
+
+
+TaskFinalizer = Callable[[TaskRecord], Awaitable[TaskFinalization]]
 
 
 class TaskManager:
@@ -86,7 +101,19 @@ class TaskManager:
                 value = value.replace(secret, "[REDACTED]")
         return _truncate(value)
 
-    def _make_id(self) -> str:
+    def _append_finalization(self, value: str, suffix: str) -> str:
+        redacted_suffix = suffix
+        for secret in self.sensitive_values:
+            if secret:
+                redacted_suffix = redacted_suffix.replace(secret, "[REDACTED]")
+        suffix_bytes = redacted_suffix.encode("utf-8")
+        if len(suffix_bytes) >= MAX_RESULT_BYTES:
+            return _truncate(redacted_suffix)
+        separator = "\n\n" if value else ""
+        budget = MAX_RESULT_BYTES - len(suffix_bytes) - len(separator.encode("utf-8"))
+        return f"{_truncate(value, budget)}{separator}{redacted_suffix}"
+
+    def make_task_id(self) -> str:
         return f"task-{uuid.uuid4().hex[:12]}"
 
     def _evict_for_capacity(self) -> None:
@@ -110,15 +137,52 @@ class TaskManager:
         name: str,
         *,
         background: bool,
+        task_id: str | None = None,
+        finalizer: TaskFinalizer | None = None,
     ) -> TaskRecord:
         if self._closed:
             raise RuntimeError("SubAgent task manager is closed.")
         if self._active_count() >= self.config.max_running:
             raise RuntimeError("At most the configured number of SubAgents may run.")
         self._evict_for_capacity()
-        record = TaskRecord(self._make_id(), self._redact(name), child, prompt, background)
+        task_id = task_id or self.make_task_id()
+        if task_id in self._records:
+            raise RuntimeError("SubAgent task ID is already in use.")
+        record = TaskRecord(
+            task_id,
+            self._redact(name),
+            child,
+            prompt,
+            background,
+            finalizer=finalizer,
+        )
         self._records[record.id] = record
         return record
+
+    async def _finalize(self, record: TaskRecord) -> None:
+        if record.finalizer is None or record.finalizer_consumed:
+            return
+        record.finalizer_consumed = True
+        try:
+            finalized = await record.finalizer(record)
+        except asyncio.CancelledError:
+            record.warnings = (
+                *record.warnings,
+                "Task finalizer was interrupted; resources were kept.",
+            )
+            return
+        except Exception:
+            record.warnings = (*record.warnings, "Task finalizer failed; resources were kept.")
+            return
+        record.warnings = (
+            *record.warnings,
+            *(self._redact(warning) for warning in finalized.warnings),
+        )
+        if finalized.suffix:
+            if record.result:
+                record.result = self._append_finalization(record.result, finalized.suffix)
+            else:
+                record.error = self._append_finalization(record.error, finalized.suffix)
 
     def _approval(self, record: TaskRecord):
         async def approve(request: ApprovalRequest):
@@ -169,6 +233,7 @@ class TaskManager:
             record.status = TaskStatus.FAILED
             record.error = self._redact(f"SubAgent failed ({type(exc).__name__}).")
         finally:
+            await self._finalize(record)
             self.broker.cancel_task(record.id)
             if record.background or record.detach_event.is_set():
                 result = record.result or record.error
@@ -193,11 +258,20 @@ class TaskManager:
         name: str,
         *,
         background: bool,
+        task_id: str | None = None,
+        finalizer: TaskFinalizer | None = None,
     ) -> LaunchResult:
-        record = self._new_record(child, prompt, name, background=background)
+        record = self._new_record(
+            child,
+            prompt,
+            name,
+            background=background,
+            task_id=task_id,
+            finalizer=finalizer,
+        )
         record.task = asyncio.create_task(self._run(record))
         if background:
-            return LaunchResult(record.id, "async_launched")
+            return LaunchResult(record.id, "async_launched", warnings=record.warnings)
         self._foreground_id = record.id
         detach_task = asyncio.create_task(record.detach_event.wait())
         timer_task = (
@@ -216,13 +290,15 @@ class TaskManager:
                     record.id,
                     record.status.value,
                     record.result or record.error,
+                    record.warnings,
                 )
             record.background = True
             reason = "moved_to_background" if detach_task in done else "timed_out_to_background"
-            return LaunchResult(record.id, reason)
+            return LaunchResult(record.id, reason, warnings=record.warnings)
         except asyncio.CancelledError:
             if not record.detach_event.is_set():
                 record.child.runner.cancel()
+            record.background = True
             raise
         finally:
             self._foreground_id = None
@@ -265,6 +341,8 @@ class TaskManager:
         record = self._records.get(task_id)
         if record is None or record.status is not TaskStatus.COMPLETED:
             raise ValueError("Only a retained completed task can receive another message.")
+        if record.finalizer_consumed:
+            raise ValueError("A finalized isolated task cannot receive another message.")
         if self._active_count() >= self.config.max_running:
             raise RuntimeError("At most the configured number of SubAgents may run.")
         record.prompt = message
@@ -273,7 +351,7 @@ class TaskManager:
         record.result = ""
         record.error = ""
         record.task = asyncio.create_task(self._run(record))
-        return LaunchResult(record.id, "async_launched")
+        return LaunchResult(record.id, "async_launched", warnings=record.warnings)
 
     def take_notifications(self) -> tuple[str, ...]:
         notifications = tuple(self._notifications)
@@ -301,9 +379,13 @@ class TaskManager:
                 record.child.runner.cancel()
         tasks = tuple(item.task for item in self._records.values() if item.task is not None)
         if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=1.0)
+            _done, pending = await asyncio.wait(tasks, timeout=4.5)
             for task in pending:
                 task.cancel()
             if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+                _done, still_pending = await asyncio.wait(pending, timeout=0.5)
+                for task in still_pending:
+                    task.cancel()
+                if still_pending:
+                    await asyncio.gather(*still_pending, return_exceptions=True)
         await self.broker.close()

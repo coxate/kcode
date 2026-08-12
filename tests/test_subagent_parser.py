@@ -18,12 +18,16 @@ def test_agent_meta_is_strict_and_safe() -> None:
     meta = AgentMeta(name="code-reviewer", description="Review code")
     assert meta.model == "inherit"
     assert meta.tools == ()
+    assert meta.isolation == "shared"
+    isolated = AgentMeta(name="worker", description="Work", isolation="worktree")
+    assert isolated.isolation == "worktree"
     for payload in (
         {"name": "Bad", "description": "x"},
         {"name": "bad--name", "description": "x"},
         {"name": "ok", "description": "two\nlines"},
         {"name": "ok", "description": "x", "unknown": True},
         {"name": "ok", "description": "x", "tools": ["read_file", "read_file"]},
+        {"name": "ok", "description": "x", "isolation": "container"},
     ):
         with pytest.raises(ValidationError):
             AgentMeta.model_validate(payload)

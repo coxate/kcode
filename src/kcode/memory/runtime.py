@@ -249,9 +249,7 @@ class MemoryCoordinator:
                 state = store.load_state()
                 if session_id not in state.completed_session_ids:
                     state = state.model_copy(
-                        update={
-                            "completed_session_ids": (*state.completed_session_ids, session_id)
-                        }
+                        update={"completed_session_ids": (*state.completed_session_ids, session_id)}
                     )
                     await asyncio.to_thread(store.save_state, state)
                     self._reload(scope)
@@ -308,9 +306,7 @@ class MemoryCoordinator:
                 return
             try:
                 active_records = tuple(
-                    record
-                    for record in self.records()
-                    if record.status == MemoryStatus.ACTIVE
+                    record for record in self.records() if record.status == MemoryStatus.ACTIVE
                 )
                 active_index = render_index(active_records)
                 proposals = await self.extractor.extract(turn, active_index, active_records)

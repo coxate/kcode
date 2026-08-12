@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
+
 from kcode.config import SubAgentConfig
 from kcode.subagents.catalog import AgentCatalog
 from kcode.subagents.factory import SubAgentFactory
-from kcode.subagents.manager import LaunchResult, TaskManager
+from kcode.subagents.manager import LaunchResult, TaskFinalization, TaskManager
 from kcode.tools.base import ToolResult
+from kcode.worktrees import WorktreeManager, WorktreeRecord
 
 FORK_BOILERPLATE = """<fork-subagent>
 Work only on the delegated task. Use the inherited context as evidence, do not start or control
@@ -21,12 +25,14 @@ class SubAgentService:
         manager: TaskManager,
         parent,
         config: SubAgentConfig,
+        worktrees: WorktreeManager | None = None,
     ) -> None:
         self.catalog = catalog
         self.factory = factory
         self.manager = manager
         self.parent = parent
         self.config = config
+        self.worktrees = worktrees
 
     def set_catalog(self, catalog: AgentCatalog) -> None:
         self.catalog = catalog
@@ -84,18 +90,12 @@ class SubAgentService:
                 "Background SubAgents are disabled.",
             )
         try:
-            child = self.factory.defined(
+            launched = await self._launch_defined(
                 definition,
-                self.parent,
-                self.current_mode,
-                self.parent.approve,
-                background=background,
-            )
-            launched = await self.manager.launch(
-                child,
                 prompt,
                 name or description,
                 background=background,
+                mode=self.current_mode,
             )
         except (KeyError, RuntimeError, ValueError) as exc:
             return ToolResult.failure("subagent_launch_failed", str(exc))
@@ -124,18 +124,90 @@ class SubAgentService:
         definition, _ = self.catalog.resolve(subagent_type)
         if definition is None:
             raise ValueError(f"Unknown or unavailable Agent: {subagent_type}")
-        child = self.factory.defined(
+        return await self._launch_defined(
             definition,
-            self.parent,
-            mode,
-            self.parent.approve,
-            background=True,
-        )
-        return await self.manager.launch(
-            child,
             prompt,
             name or definition.meta.name,
             background=True,
+            mode=mode,
+        )
+
+    async def _launch_defined(
+        self,
+        definition,
+        prompt: str,
+        name: str,
+        *,
+        background: bool,
+        mode,
+    ) -> LaunchResult:
+        if definition.meta.isolation == "shared":
+            child = self.factory.defined(
+                definition,
+                self.parent,
+                mode,
+                self.parent.approve,
+                background=background,
+            )
+            return await self.manager.launch(child, prompt, name, background=background)
+        if self.worktrees is None:
+            raise RuntimeError("Worktree isolation is unavailable.")
+        task_id = self.manager.make_task_id()
+        record = await self.worktrees.create_agent(task_id)
+
+        async def finalize(_task_record) -> TaskFinalization:
+            report = await self.worktrees.finalize(record, task_id)
+            return TaskFinalization(report.render(), report.warnings)
+
+        try:
+            context = replace(
+                self.parent.context,
+                workspace_root=record.path,
+                cancel_event=None,
+                use_shell=False,
+            )
+            child = self.factory.defined(
+                definition,
+                self.parent,
+                mode,
+                self.parent.approve,
+                background=background,
+                context=context,
+                worktree_notice=self._worktree_notice(record),
+            )
+            return await self.manager.launch(
+                child,
+                prompt,
+                name,
+                background=background,
+                task_id=task_id,
+                finalizer=finalize,
+            )
+        except asyncio.CancelledError:
+            if self.manager.get(task_id) is None:
+                await self.worktrees.finalize(record, task_id)
+            raise
+        except Exception as exc:
+            existing = self.manager.get(task_id)
+            if existing is not None:
+                raise
+            report = await self.worktrees.finalize(record, task_id)
+            raise RuntimeError(
+                "SubAgent launch failed after Worktree creation.\n\n" + report.render()
+            ) from exc
+
+    def _worktree_notice(self, record: WorktreeRecord) -> str:
+        parent_root = self.parent.context.workspace_root
+        return (
+            "<worktree-context>\n"
+            "You are running in an isolated Git Worktree.\n"
+            f"Parent workspace: {parent_root}\n"
+            f"Your workspace: {record.path}\n"
+            f"Your branch: {record.branch}\n"
+            "Remap absolute paths from the parent conversation into your workspace, "
+            "and re-read local files before editing. Do not access the parent workspace "
+            "or another Worktree.\n"
+            "</worktree-context>"
         )
 
     @staticmethod
@@ -164,6 +236,7 @@ class SubAgentService:
                 "result": record.result,
                 "error": record.error,
                 "tokens": record.usage.total_tokens,
+                "warnings": list(record.warnings),
             }
         )
 

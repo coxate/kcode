@@ -36,9 +36,7 @@ You only propose changes. A human must approve every proposal."""
 SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}\b"),
-    re.compile(
-        r"(?i)\b(?:password|passwd|api[_-]?key|token|secret)\s*[:=]\s*['\"]?[^\s'\"]{8,}"
-    ),
+    re.compile(r"(?i)\b(?:password|passwd|api[_-]?key|token|secret)\s*[:=]\s*['\"]?[^\s'\"]{8,}"),
 )
 GLOBAL_FEEDBACK = re.compile(
     r"\b(?:all|every) projects?\b|所有项目|每个项目|全局(?:都|适用)", re.IGNORECASE
@@ -125,8 +123,10 @@ class MemoryExtractor:
         proposals: list[MemoryProposal] = []
         for item in envelope.candidates:
             scope = item.scope
-            if item.type == MemoryType.FEEDBACK and scope == MemoryScope.USER and not (
-                GLOBAL_FEEDBACK.search(turn.user_text)
+            if (
+                item.type == MemoryType.FEEDBACK
+                and scope == MemoryScope.USER
+                and not (GLOBAL_FEEDBACK.search(turn.user_text))
             ):
                 scope = MemoryScope.PROJECT
             if item.action != MemoryAction.CREATE:

@@ -102,9 +102,10 @@ class MemoryProposal(StrictModel):
             raise ValueError("create proposals cannot have targets")
         if self.action != MemoryAction.CREATE and not self.target_ids:
             raise ValueError(f"{self.action.value} proposals require targets")
-        if self.action in {MemoryAction.UPDATE, MemoryAction.INACTIVATE} and len(
-            self.target_ids
-        ) != 1:
+        if (
+            self.action in {MemoryAction.UPDATE, MemoryAction.INACTIVATE}
+            and len(self.target_ids) != 1
+        ):
             raise ValueError(f"{self.action.value} proposals require exactly one target")
         if self.action == MemoryAction.MERGE and len(self.target_ids) < 2:
             raise ValueError("merge proposals require at least two targets")

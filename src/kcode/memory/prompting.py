@@ -102,8 +102,6 @@ def render_prompt(
         sections.extend(("", "Additional recent memories:", *extra))
     content = "\n".join(sections).rstrip()
     warnings = (
-        (f"{excluded} active memories were excluded from the prompt budget.",)
-        if excluded
-        else ()
+        (f"{excluded} active memories were excluded from the prompt budget.",) if excluded else ()
     )
     return PromptMemoryResult(content=content, excluded=excluded, warnings=warnings)

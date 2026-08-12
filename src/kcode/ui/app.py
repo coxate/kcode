@@ -100,6 +100,7 @@ from kcode.ui.memory import (
 from kcode.ui.resume import ResumeScreen
 from kcode.ui.skill_trust import SkillTrustScreen
 from kcode.ui.widgets import AssistantResponse, ChatMessageWidget, ToolCallWidget
+from kcode.worktrees import WorktreeError, WorktreeManager, WorktreeStatus
 
 CAT_BANNER = r""" /\_/\
 ( o.o )   KCode v{version}
@@ -177,6 +178,7 @@ class KCodeApp(App[None]):
         subagent_config: SubAgentConfig | None = None,
         agent_builder: AgentCatalogBuilder | None = None,
         agent_trust_store: AgentTrustStore | None = None,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -209,6 +211,7 @@ class KCodeApp(App[None]):
         self.agent_builder = agent_builder or AgentCatalogBuilder(self.cwd)
         self.agent_trust_store = agent_trust_store or AgentTrustStore()
         self.subagent_config = subagent_config or SubAgentConfig()
+        self.worktree_manager = worktree_manager or WorktreeManager(self.cwd)
         self.skill_runtime = SkillRuntime()
         if self.registry.get("load_skill") is None:
             self.registry.register(LoadSkillTool(self.skill_runtime))
@@ -260,6 +263,7 @@ class KCodeApp(App[None]):
             self.task_manager,
             self.runner,
             self.subagent_config,
+            self.worktree_manager,
         )
         register_subagent_tools(self.registry, self.subagent_service)
         self.runner.bind_task_notifications(self.task_manager)
@@ -877,6 +881,78 @@ class KCodeApp(App[None]):
             return SessionInfo(False)
         runtime = self.coordinator.current
         return SessionInfo(True, runtime.session_id, str(runtime.journal.path))
+
+    async def command_worktree_create(self, name: str) -> None:
+        try:
+            record, warnings = await self.worktree_manager.create_manual(name)
+        except WorktreeError as exc:
+            await self._append_notice(str(exc), "error")
+            return
+        await self._append_notice(
+            "\n".join(
+                (
+                    "Worktree 已创建。",
+                    f"名称：{record.name}",
+                    f"路径：{record.path}",
+                    f"分支：{record.branch}",
+                    f"基线：{record.base_commit}",
+                    *(f"警告：{warning}" for warning in warnings),
+                )
+            )
+        )
+
+    @staticmethod
+    def _worktree_status_text(status: WorktreeStatus) -> str:
+        def known(value: object | None) -> str:
+            if value is None:
+                return "unknown"
+            if isinstance(value, bool):
+                return str(value).lower()
+            return str(value)
+
+        return "\n".join(
+            (
+                f"名称：{status.path.name}",
+                f"路径：{status.path}",
+                f"分支：{known(status.branch)}",
+                f"基线：{known(status.record.base_commit if status.record else None)}",
+                f"HEAD：{known(status.head_commit)}",
+                f"dirty：{known(status.dirty)}",
+                f"新 commit：{known(status.head_changed)}",
+                f"托管：{known(status.managed)}",
+                f"可安全删除：{known(status.removable)}",
+                *(f"警告：{warning}" for warning in status.warnings),
+            )
+        )
+
+    async def command_worktree_list(self) -> None:
+        try:
+            statuses = await self.worktree_manager.list()
+        except WorktreeError as exc:
+            await self._append_notice(str(exc), "error")
+            return
+        if not statuses:
+            await self._append_notice("当前仓库没有 Kcode Worktree。")
+            return
+        await self._append_notice(
+            "\n\n".join(self._worktree_status_text(item) for item in statuses)
+        )
+
+    async def command_worktree_status(self, name: str) -> None:
+        try:
+            status = await self.worktree_manager.status(name)
+        except WorktreeError as exc:
+            await self._append_notice(str(exc), "error")
+            return
+        await self._append_notice(self._worktree_status_text(status))
+
+    async def command_worktree_remove(self, name: str) -> None:
+        try:
+            report = await self.worktree_manager.remove_manual(name)
+        except WorktreeError as exc:
+            await self._append_notice(str(exc), "error")
+            return
+        await self._append_notice(report.render(), "system" if not report.kept else "error")
 
     def _set_generating(self, value: bool) -> None:
         self.generating = value
