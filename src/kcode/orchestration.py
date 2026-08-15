@@ -5,6 +5,7 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol
 
 from kcode import __version__
 from kcode.config import AgentConfig
@@ -13,8 +14,10 @@ from kcode.conversation import (
     AssistantMessage,
     Conversation,
     ConversationMessage,
+    EnvironmentMessage,
     ProviderContinuationState,
     StableSystemMessage,
+    SystemReminderMessage,
     ToolResultMessage,
     UserMessage,
 )
@@ -39,6 +42,16 @@ from kcode.events import (
     TurnNotice,
     UsageReported,
 )
+from kcode.history.models import PersistenceState
+from kcode.history.runtime import SessionRuntime
+from kcode.hooks.models import (
+    HookContext,
+    HookDispatchResult,
+    HookEvent,
+    ToolRejectedError,
+)
+from kcode.memory.models import CompletedTurn
+from kcode.memory.runtime import MemoryCoordinator
 from kcode.permissions.models import PermissionMode
 from kcode.prompting import (
     DEFAULT_PROMPT_SECTIONS,
@@ -55,6 +68,11 @@ from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import ToolRegistry
 from kcode.tools.scheduler import ToolScheduler
 
+if TYPE_CHECKING:
+    from kcode.hooks.engine import HookEngine
+    from kcode.hooks.runtime import HookSession
+    from kcode.skills.runtime import SkillRuntime
+
 PLAN_TOOL_NAMES = {"read_file", "find_files", "search_code", "run_command"}
 
 
@@ -70,6 +88,21 @@ class ModelResponse:
     stop_reason: str | None
     continuation_state: ProviderContinuationState | None
     usage: TokenUsage | None
+
+
+@dataclass(frozen=True, slots=True)
+class DelegationSnapshot:
+    request_messages: tuple[ConversationMessage, ...]
+    tools: tuple
+    mode: PermissionMode
+
+
+class TaskNotificationSource(Protocol):
+    def take_notifications(self) -> tuple[str, ...]: ...
+
+
+class TeamMessageSource(Protocol):
+    def take_team_messages(self) -> tuple[str, ...]: ...
 
 
 class StreamAccumulator:
@@ -128,6 +161,8 @@ class AgentRunner:
         prompt_builder: SystemPromptBuilder | None = None,
         environment_collector: EnvironmentCollector | None = None,
         context_manager: ContextManager | None = None,
+        request_seed: Sequence[ConversationMessage] = (),
+        is_subagent: bool = False,
     ) -> None:
         self.provider = provider
         self.conversation = conversation
@@ -138,6 +173,8 @@ class AgentRunner:
         self.config = config or AgentConfig()
         self.scheduler = scheduler or ToolScheduler(executor, self.config.max_parallel_tools)
         self.prompt_builder = prompt_builder or SystemPromptBuilder(DEFAULT_PROMPT_SECTIONS)
+        self._available_skills_content = self.prompt_builder.content("available_skills")
+        self._available_agents_content = ""
         self.environment_collector = environment_collector or EnvironmentCollector()
         self._stable_system = StableSystemMessage(self.prompt_builder.build())
         provider_config = getattr(provider, "config", None)
@@ -149,35 +186,244 @@ class AgentRunner:
             sensitive_values=context.sensitive_values,
         )
         self._cancel_event: asyncio.Event | None = None
+        self._session_runtime: SessionRuntime | None = None
+        self._memory_coordinator: MemoryCoordinator | None = None
+        self._skill_runtime: SkillRuntime | None = None
+        self._hook_engine: HookEngine | None = None
+        self._hook_session: HookSession | None = None
+        self._request_seed = tuple(request_seed)
+        self._delegation_snapshot: DelegationSnapshot | None = None
+        self._task_notifications: TaskNotificationSource | None = None
+        self._team_messages: TeamMessageSource | None = None
+        self.is_subagent = is_subagent
 
     def cancel(self) -> None:
         if self._cancel_event is not None:
             self._cancel_event.set()
 
+    def bind_session(self, runtime: SessionRuntime) -> tuple[str, ...]:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot switch sessions while the agent is running.")
+        self._session_runtime = runtime
+        self.conversation = runtime.conversation
+        self.context_manager = runtime.context_manager
+        self._hook_session = runtime
+        if self._skill_runtime is not None:
+            return self._skill_runtime.bind_session(runtime)
+        return ()
+
+    def bind_memory(self, coordinator: MemoryCoordinator) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind long-term memory while the agent is running.")
+        self._memory_coordinator = coordinator
+
+    def bind_skills(self, runtime: SkillRuntime) -> tuple[str, ...]:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind Skills while the agent is running.")
+        self._skill_runtime = runtime
+        return runtime.bind_session(self._session_runtime)
+
+    def bind_hooks(
+        self,
+        engine: HookEngine,
+        session: HookSession | None = None,
+    ) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind Hooks while the agent is running.")
+        self._hook_engine = engine
+        self._hook_session = session if session is not None else self._session_runtime
+
+    @property
+    def hook_engine(self) -> HookEngine | None:
+        return self._hook_engine
+
+    @property
+    def hook_session(self) -> HookSession | None:
+        return self._hook_session
+
+    @property
+    def skill_runtime(self) -> SkillRuntime | None:
+        return self._skill_runtime
+
+    @property
+    def delegation_snapshot(self) -> DelegationSnapshot | None:
+        return self._delegation_snapshot
+
+    def bind_task_notifications(self, source: TaskNotificationSource) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind task notifications while the agent is running.")
+        self._task_notifications = source
+
+    def bind_team_messages(self, source: TeamMessageSource) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot bind Team messages while the agent is running.")
+        self._team_messages = source
+
+    def update_available_skills(self, content: str) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot update Skills while the agent is running.")
+        self._available_skills_content = content
+        self._update_capabilities_prompt()
+
+    def _update_capabilities_prompt(self) -> None:
+        content = "\n\n".join(
+            item
+            for item in (
+                self._available_skills_content.strip(),
+                self._available_agents_content.strip(),
+            )
+            if item
+        )
+        self.prompt_builder = self.prompt_builder.with_content("available_skills", content)
+        self._stable_system = StableSystemMessage(self.prompt_builder.build())
+
+    def update_available_agents(self, content: str) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot update Agents while the agent is running.")
+        self._available_agents_content = content
+        self._update_capabilities_prompt()
+
+    def update_long_term_memory(self, content: str) -> None:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot update long-term memory while the agent is running.")
+        self.prompt_builder = self.prompt_builder.with_content("long_term_memory", content)
+        self._stable_system = StableSystemMessage(self.prompt_builder.build())
+
     def update_tool_context(self, context: ToolContext) -> None:
         self.context = context
         self.context_manager.update_sensitive_values(context.sensitive_values)
+        if self._session_runtime is not None:
+            self._session_runtime.journal.update_sensitive_values(context.sensitive_values)
+        if self._hook_engine is not None:
+            self._hook_engine.update_sensitive_values(context.sensitive_values)
 
     async def clear_context(self) -> None:
         await self.context_manager.clear()
 
+    async def commit_external_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        mode: PermissionMode,
+    ) -> tuple[str, ...]:
+        if self._cancel_event is not None:
+            raise RuntimeError("Cannot commit an external turn while the agent is running.")
+        start = len(self.conversation.messages_snapshot())
+        handle = self.conversation.begin_turn(user_text)
+        self.conversation.complete_turn(handle, AssistantMessage(assistant_text))
+        warnings: list[str] = []
+        _, saved = await self._persist_since(self._session_runtime, start)
+        if not saved and self._session_runtime is not None:
+            warnings.append(self._persistence_warning(self._session_runtime))
+        if self._memory_coordinator is not None:
+            try:
+                session_id = (
+                    self._session_runtime.session_id
+                    if self._session_runtime is not None
+                    else "in-memory"
+                )
+                self._memory_coordinator.submit_turn(
+                    CompletedTurn.create(
+                        session_id,
+                        user_text,
+                        assistant_text,
+                        mode.value,
+                    )
+                )
+            except Exception as exc:
+                warnings.append(f"Long-term memory extraction was not queued: {exc}")
+        return tuple(warnings)
+
     async def compact_context(
         self,
         session: AgentSession | None = None,
+        *,
+        focus: str | None = None,
     ) -> ContextSnapshot:
         if self._cancel_event is not None:
             raise RuntimeError("Cannot compact context while the agent is running.")
         active_session = session or AgentSession()
         definitions = self._definitions_for_mode(active_session.permission_mode)
-        return await self.context_manager.compact(
+        snapshot = await self.context_manager.compact(
             self.conversation.messages_snapshot(),
             definitions,
             prefix_messages=(self._stable_system,),
+            focus=focus,
         )
+        result = snapshot.compaction_result
+        if result is not None and self._hook_engine is not None:
+            error = "" if result.success else (result.failure_reason or "failed")
+            hook_result = await self._run_hooks(
+                HookEvent.COMPACT,
+                active_session.permission_mode,
+                message=f"manual: {result.before_tokens} -> {result.after_tokens or '?'}",
+                error=error,
+            )
+            for warning in hook_result.warnings:
+                self._hook_engine.runtime.add_warning(warning)
+            if error:
+                error_result = await self._run_hooks(
+                    HookEvent.ERROR,
+                    active_session.permission_mode,
+                    message="compact",
+                    error=error,
+                )
+                for warning in error_result.warnings:
+                    self._hook_engine.runtime.add_warning(warning)
+        return snapshot
 
     def _definitions_for_mode(self, mode: PermissionMode):
         plan_tools = PLAN_TOOL_NAMES | self.registry.names_with_effect(ToolEffect.READ_ONLY)
         return self.registry.definitions(plan_tools if mode == PermissionMode.PLAN else None)
+
+    def tool_definitions(self, mode: PermissionMode):
+        return self._definitions_for_mode(mode)
+
+    def _hook_context(
+        self,
+        event: HookEvent,
+        mode: PermissionMode,
+        *,
+        message: str = "",
+        error: str = "",
+        command: str = "",
+        tool_name: str = "",
+        tool_args=None,
+        file_path: str = "",
+        tool_status: str = "",
+        iteration: int = 0,
+    ) -> HookContext:
+        session_id = (
+            self._session_runtime.session_id if self._session_runtime is not None else "in-memory"
+        )
+        return HookContext(
+            event,
+            session_id,
+            self.context.workspace_root,
+            mode,
+            tool_name,
+            tool_args or {},
+            file_path,
+            message,
+            error,
+            command,
+            tool_status,
+            iteration,
+            self.is_subagent,
+        )
+
+    async def _run_hooks(
+        self,
+        event: HookEvent,
+        mode: PermissionMode,
+        **values,
+    ) -> HookDispatchResult:
+        if self._hook_engine is None:
+            return HookDispatchResult()
+        return await self._hook_engine.run_hooks(
+            self._hook_context(event, mode, **values),
+            self._hook_session,
+        )
 
     async def _context_or_cancel(
         self,
@@ -260,6 +506,9 @@ class AgentRunner:
         cancel_event = asyncio.Event()
         self._cancel_event = cancel_event
         history = self.conversation.messages_snapshot()
+        persisted_index = len(history)
+        active_runtime = self._session_runtime
+        resume_reminder = active_runtime.resume_reminder if active_runtime is not None else None
         handle = self.conversation.begin_turn(user_text)
         current: list[ConversationMessage] = [UserMessage(user_text)]
         cumulative_usage: TokenUsage | None = None
@@ -271,8 +520,22 @@ class AgentRunner:
             model=self.provider.model_name,
         )
         iteration = 0
+        turn_end_message = ""
+        turn_end_error = "cancelled"
 
         try:
+            if (
+                active_runtime is not None
+                and active_runtime.journal.state == PersistenceState.DEGRADED
+            ):
+                yield TurnNotice(self._persistence_warning(active_runtime))
+            start_hooks = await self._run_hooks(
+                HookEvent.TURN_START,
+                active_session.permission_mode,
+                message=user_text,
+            )
+            for warning in start_hooks.warnings:
+                yield TurnNotice(warning.render())
             for iteration in range(1, self.config.max_iterations + 1):
                 if cancel_event.is_set():
                     raise _AgentCancelled
@@ -285,28 +548,98 @@ class AgentRunner:
                     AgentPhase.MODEL,
                 )
                 response: ModelResponse | None = None
-                reminders = (
-                    (build_plan_mode_reminder(iteration),)
-                    if mode == PermissionMode.PLAN
-                    else ((approved_plan_reminder,) if approved_plan_reminder is not None else ())
+                send_hooks = await self._run_hooks(
+                    HookEvent.PRE_SEND,
+                    mode,
+                    message=user_text,
+                    iteration=iteration,
                 )
+                for warning in send_hooks.warnings:
+                    yield TurnNotice(warning.render())
+                reminder_items = []
+                if mode == PermissionMode.PLAN:
+                    reminder_items.append(build_plan_mode_reminder(iteration))
+                elif approved_plan_reminder is not None:
+                    reminder_items.append(approved_plan_reminder)
+                if resume_reminder is not None:
+                    reminder_items.append(resume_reminder)
+                if self._hook_engine is not None:
+                    reminder_items.extend(
+                        self._hook_engine.runtime.take_prompts(self._hook_session)
+                    )
+                if self._task_notifications is not None:
+                    reminder_items.extend(
+                        SystemReminderMessage("task", item)
+                        for item in self._task_notifications.take_notifications()
+                    )
+                if self._team_messages is not None:
+                    reminder_items.extend(
+                        SystemReminderMessage("team", item)
+                        for item in self._team_messages.take_team_messages()
+                    )
+                reminders = tuple(reminder_items)
+                active_content = (
+                    self._skill_runtime.active_prompt() if self._skill_runtime is not None else ""
+                )
+                dynamic_environment = environment
+                if active_content:
+                    dynamic_environment = EnvironmentMessage(
+                        f"{environment.content}\n\n{active_content}"
+                    )
                 prompt_package = PromptPackage(
                     self._stable_system,
-                    environment,
+                    dynamic_environment,
                     reminders,
                 )
                 canonical_messages = (*history, *current)
+                snapshot_canonical = canonical_messages
+                snapshot_prefix = prompt_package.messages()
+                if self._request_seed:
+                    snapshot_canonical = tuple(current)
+                    extra_environment = (
+                        (EnvironmentMessage(active_content),) if active_content else ()
+                    )
+                    snapshot_prefix = (
+                        *self._request_seed,
+                        *extra_environment,
+                        *reminders,
+                    )
                 snapshot = await self._context_or_cancel(
                     self.context_manager.build_snapshot(
-                        canonical_messages,
+                        snapshot_canonical,
                         definitions,
-                        prefix_messages=prompt_package.messages(),
+                        prefix_messages=snapshot_prefix,
                     ),
                     cancel_event,
                 )
                 request_messages = snapshot.messages
+                self._delegation_snapshot = DelegationSnapshot(
+                    tuple(request_messages), tuple(definitions), mode
+                )
                 if snapshot.compaction_result is not None:
                     result = snapshot.compaction_result
+                    compact_error = "" if result.success else (result.failure_reason or "failed")
+                    compact_hooks = await self._run_hooks(
+                        HookEvent.COMPACT,
+                        mode,
+                        message=(
+                            f"automatic: {result.before_tokens} -> {result.after_tokens or '?'}"
+                        ),
+                        error=compact_error,
+                        iteration=iteration,
+                    )
+                    for warning in compact_hooks.warnings:
+                        yield TurnNotice(warning.render())
+                    if compact_error:
+                        compact_error_hooks = await self._run_hooks(
+                            HookEvent.ERROR,
+                            mode,
+                            message="compact",
+                            error=compact_error,
+                            iteration=iteration,
+                        )
+                        for warning in compact_error_hooks.warnings:
+                            yield TurnNotice(warning.render())
                     if result.success:
                         yield TurnNotice(
                             "上下文已自动压缩："
@@ -315,6 +648,11 @@ class AgentRunner:
                         )
                     else:
                         yield TurnNotice(f"自动上下文压缩失败：{result.failure_reason}")
+                    if self._hook_engine is not None:
+                        request_messages = (
+                            *request_messages,
+                            *self._hook_engine.runtime.take_prompts(self._hook_session),
+                        )
                 emergency_attempted = False
                 while True:
                     try:
@@ -334,12 +672,42 @@ class AgentRunner:
                         emergency_attempted = True
                         emergency = await self._context_or_cancel(
                             self.context_manager.emergency_snapshot(
-                                canonical_messages,
+                                snapshot_canonical,
                                 definitions,
-                                prefix_messages=prompt_package.messages(),
+                                prefix_messages=snapshot_prefix,
                             ),
                             cancel_event,
                         )
+                        emergency_result = emergency.compaction_result
+                        if emergency_result is not None:
+                            emergency_error = (
+                                ""
+                                if emergency_result.success
+                                else (emergency_result.failure_reason or "failed")
+                            )
+                            emergency_hooks = await self._run_hooks(
+                                HookEvent.COMPACT,
+                                mode,
+                                message=(
+                                    "emergency: "
+                                    f"{emergency_result.before_tokens} -> "
+                                    f"{emergency_result.after_tokens or '?'}"
+                                ),
+                                error=emergency_error,
+                                iteration=iteration,
+                            )
+                            for warning in emergency_hooks.warnings:
+                                yield TurnNotice(warning.render())
+                            if emergency_error:
+                                error_hooks = await self._run_hooks(
+                                    HookEvent.ERROR,
+                                    mode,
+                                    message="compact",
+                                    error=emergency_error,
+                                    iteration=iteration,
+                                )
+                                for warning in error_hooks.warnings:
+                                    yield TurnNotice(warning.render())
                         if not emergency.budget.fits_after_emergency:
                             raise ProviderError(
                                 ProviderErrorKind.PROMPT_TOO_LONG,
@@ -347,9 +715,23 @@ class AgentRunner:
                                 "context window.",
                             ) from exc
                         request_messages = emergency.messages
+                        if self._hook_engine is not None:
+                            request_messages = (
+                                *request_messages,
+                                *self._hook_engine.runtime.take_prompts(self._hook_session),
+                            )
                         response = None
                         yield TurnNotice("上下文超过模型窗口，已紧急压缩并重试一次。")
                 assert response is not None
+
+                receive_hooks = await self._run_hooks(
+                    HookEvent.POST_RECEIVE,
+                    mode,
+                    message=response.text[: 32 * 1024],
+                    iteration=iteration,
+                )
+                for warning in receive_hooks.warnings:
+                    yield TurnNotice(warning.render())
 
                 request_usage = response.usage or TokenUsage()
                 cumulative_usage = (
@@ -366,6 +748,7 @@ class AgentRunner:
 
                 if not response.tool_calls:
                     if not response.text.strip():
+                        turn_end_error = "invalid_response"
                         self.conversation.stop_turn(handle)
                         turn_open = False
                         yield AgentStopped(
@@ -375,10 +758,35 @@ class AgentRunner:
                         )
                         return
                     final = AssistantMessage(response.text)
+                    turn_end_message = response.text
+                    turn_end_error = ""
                     self.conversation.complete_turn(handle, final)
                     turn_open = False
+                    persisted_index, saved = await self._persist_since(
+                        active_runtime,
+                        persisted_index,
+                    )
+                    if not saved and active_runtime is not None:
+                        yield TurnNotice(self._persistence_warning(active_runtime))
                     if mode == PermissionMode.PLAN:
                         active_session.record_plan(response.text)
+                    if self._memory_coordinator is not None:
+                        try:
+                            session_id = (
+                                active_runtime.session_id
+                                if active_runtime is not None
+                                else "in-memory"
+                            )
+                            self._memory_coordinator.submit_turn(
+                                CompletedTurn.create(
+                                    session_id,
+                                    user_text,
+                                    response.text,
+                                    mode.value,
+                                )
+                            )
+                        except Exception as exc:
+                            yield TurnNotice(f"Long-term memory extraction was not queued: {exc}")
                     yield AgentProgress(
                         mode,
                         iteration,
@@ -393,9 +801,43 @@ class AgentRunner:
                     response.tool_calls,
                     response.continuation_state,
                 )
-                prepared = tuple(
-                    self.executor.prepare(call, self.context, mode) for call in response.tool_calls
-                )
+                prepared_items = []
+                for call in response.tool_calls:
+                    validated = self.executor.validate(call)
+                    if validated.error is not None or self._hook_engine is None:
+                        prepared_items.append(
+                            self.executor.authorize(validated, self.context, mode)
+                        )
+                        continue
+                    assert validated.arguments is not None
+                    arguments = validated.arguments.model_dump(mode="json")
+                    path = arguments.get("path")
+                    pre_result = await self._hook_engine.run_pre_tool_hooks(
+                        self._hook_context(
+                            HookEvent.PRE_TOOL_USE,
+                            mode,
+                            tool_name=call.name,
+                            tool_args=arguments,
+                            file_path=path if isinstance(path, str) else "",
+                            iteration=iteration,
+                        ),
+                        self._hook_session,
+                    )
+                    if isinstance(pre_result, ToolRejectedError):
+                        prepared_items.append(
+                            self.executor.rejected(
+                                validated,
+                                hook_id=pre_result.hook_id,
+                                reason=pre_result.reason,
+                            )
+                        )
+                    else:
+                        for warning in pre_result.warnings:
+                            yield TurnNotice(warning.render())
+                        prepared_items.append(
+                            self.executor.authorize(validated, self.context, mode)
+                        )
+                prepared = tuple(prepared_items)
                 all_unknown = bool(prepared) and all(
                     item.error is not None
                     and item.error.error is not None
@@ -407,7 +849,7 @@ class AgentRunner:
                 for call in response.tool_calls:
                     yield ToolCallReady(call)
 
-                result_messages: list[ToolResultMessage] = []
+                assistant_checkpointed = False
                 for batch_index, batch in enumerate(self.scheduler.batches(prepared), 1):
                     approvals = tuple(
                         item.approval for item in batch.calls if item.approval is not None
@@ -420,7 +862,25 @@ class AgentRunner:
                             AgentPhase.APPROVAL,
                             batch_index,
                         )
-                        for request in approvals:
+                        for item in batch.calls:
+                            request = item.approval
+                            if request is None:
+                                continue
+                            arguments = (
+                                item.arguments.model_dump(mode="json")
+                                if item.arguments is not None
+                                else {}
+                            )
+                            permission_hooks = await self._run_hooks(
+                                HookEvent.PERMISSION_REQUEST,
+                                mode,
+                                message=request.reason,
+                                tool_name=item.call.name,
+                                tool_args=arguments,
+                                iteration=iteration,
+                            )
+                            for warning in permission_hooks.warnings:
+                                yield TurnNotice(warning.render())
                             yield ApprovalPending(request)
                     yield AgentProgress(
                         mode,
@@ -437,7 +897,42 @@ class AgentRunner:
                         self.approve,
                         cancel_event,
                     )
+                    batch_messages: list[ToolResultMessage] = []
                     for item, result in zip(batch.calls, results, strict=True):
+                        arguments = (
+                            item.arguments.model_dump(mode="json")
+                            if item.arguments is not None
+                            else {}
+                        )
+                        raw_path = arguments.get("path")
+                        file_path = raw_path if isinstance(raw_path, str) else ""
+                        error_message = result.error.message if result.error is not None else ""
+                        post_hooks = await self._run_hooks(
+                            HookEvent.POST_TOOL_USE,
+                            mode,
+                            error=error_message,
+                            tool_name=item.call.name,
+                            tool_args=arguments,
+                            file_path=file_path,
+                            tool_status=result.status,
+                            iteration=iteration,
+                        )
+                        for warning in post_hooks.warnings:
+                            yield TurnNotice(warning.render())
+                        if result.error is not None:
+                            error_hooks = await self._run_hooks(
+                                HookEvent.ERROR,
+                                mode,
+                                message="tool",
+                                error=error_message,
+                                tool_name=item.call.name,
+                                tool_args=arguments,
+                                file_path=file_path,
+                                tool_status=result.status,
+                                iteration=iteration,
+                            )
+                            for warning in error_hooks.warnings:
+                                yield TurnNotice(warning.render())
                         if (
                             item.call.name == "read_file"
                             and result.status == "success"
@@ -447,19 +942,47 @@ class AgentRunner:
                             content = result.data.get("content")
                             if isinstance(path, str) and isinstance(content, str):
                                 await self.context_manager.record_file_snapshot(path, content)
-                        result_messages.append(
+                        if (
+                            item.call.name in {"write_file", "edit_file"}
+                            and result.status == "success"
+                        ):
+                            normalized_path = file_path
+                            if result.data is not None and isinstance(result.data.get("path"), str):
+                                normalized_path = result.data["path"]
+                            file_hooks = await self._run_hooks(
+                                HookEvent.FILE_CHANGE,
+                                mode,
+                                tool_name=item.call.name,
+                                tool_args=arguments,
+                                file_path=normalized_path,
+                                tool_status=result.status,
+                                iteration=iteration,
+                            )
+                            for warning in file_hooks.warnings:
+                                yield TurnNotice(warning.render())
+                        batch_messages.append(
                             ToolResultMessage(item.call.id, item.call.name, result)
                         )
                         yield ToolFinished(item.call, result)
-
-                checkpoint = tuple(result_messages)
-                await self.context_manager.record_tool_results((assistant, *checkpoint))
-                self.conversation.checkpoint_tool_step(handle, assistant, checkpoint)
-                current.extend((assistant, *checkpoint))
+                    checkpoint = tuple(batch_messages)
+                    context_checkpoint = (
+                        checkpoint if assistant_checkpointed else (assistant, *checkpoint)
+                    )
+                    await self.context_manager.record_tool_results(context_checkpoint)
+                    self.conversation.checkpoint_tool_step(handle, assistant, checkpoint)
+                    current.extend(context_checkpoint)
+                    assistant_checkpointed = True
+                    persisted_index, saved = await self._persist_since(
+                        active_runtime,
+                        persisted_index,
+                    )
+                    if not saved and active_runtime is not None:
+                        yield TurnNotice(self._persistence_warning(active_runtime))
 
                 if cancel_event.is_set():
                     raise _AgentCancelled
                 if unknown_rounds >= 2:
+                    turn_end_error = "unknown_tool_limit"
                     self.conversation.stop_turn(handle)
                     turn_open = False
                     yield AgentStopped(
@@ -469,6 +992,7 @@ class AgentRunner:
                     )
                     return
                 if iteration >= self.config.max_iterations:
+                    turn_end_error = "iteration_limit"
                     self.conversation.stop_turn(handle)
                     turn_open = False
                     yield AgentStopped(
@@ -478,26 +1002,78 @@ class AgentRunner:
                     )
                     return
         except _AgentCancelled:
+            turn_end_error = "cancelled"
             if turn_open:
                 self.conversation.stop_turn(handle)
                 turn_open = False
             yield AgentStopped(AgentStopReason.CANCELLED, iteration, "用户已取消当前任务。")
         except ProviderError as exc:
+            turn_end_error = str(exc)
             if turn_open:
                 self.conversation.stop_turn(handle)
                 turn_open = False
             yield TurnNotice(f"{exc.kind.value}: {exc}")
+            error_hooks = await self._run_hooks(
+                HookEvent.ERROR,
+                active_session.permission_mode,
+                message="provider",
+                error=str(exc),
+                iteration=iteration,
+            )
+            for warning in error_hooks.warnings:
+                yield TurnNotice(warning.render())
             yield AgentStopped(AgentStopReason.STREAM_ERROR, iteration, str(exc))
         except (ValueError, TypeError) as exc:
+            turn_end_error = str(exc)
             if turn_open:
                 self.conversation.stop_turn(handle)
                 turn_open = False
             yield TurnNotice(str(exc))
+            error_hooks = await self._run_hooks(
+                HookEvent.ERROR,
+                active_session.permission_mode,
+                message="agent",
+                error=str(exc),
+                iteration=iteration,
+            )
+            for warning in error_hooks.warnings:
+                yield TurnNotice(warning.render())
             yield AgentStopped(AgentStopReason.INVALID_RESPONSE, iteration, str(exc))
         finally:
             if turn_open:
                 self.conversation.stop_turn(handle)
-            self._cancel_event = None
+            if active_runtime is not None and resume_reminder is not None:
+                active_runtime.consume_resume_reminder()
+            try:
+                if self._hook_engine is not None:
+                    end_hooks = await self._run_hooks(
+                        HookEvent.TURN_END,
+                        active_session.permission_mode,
+                        message=turn_end_message,
+                        error=turn_end_error,
+                        iteration=iteration,
+                    )
+                    for warning in end_hooks.warnings:
+                        self._hook_engine.runtime.add_warning(warning)
+            finally:
+                self._cancel_event = None
+
+    async def _persist_since(
+        self,
+        runtime: SessionRuntime | None,
+        start: int,
+    ) -> tuple[int, bool]:
+        snapshot = self.conversation.messages_snapshot()
+        end = len(snapshot)
+        if runtime is None or end <= start:
+            return end, True
+        saved = await runtime.journal.append_checkpoint(snapshot[start:end])
+        return end, saved
+
+    @staticmethod
+    def _persistence_warning(runtime: SessionRuntime) -> str:
+        detail = runtime.journal.failure_reason or "unknown disk error"
+        return f"Session persistence is incomplete; memory-only conversation continues: {detail}"
 
 
 # 兼容 0.2.0 中引用的内部名称；新代码统一使用 AgentRunner。

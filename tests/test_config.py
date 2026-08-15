@@ -115,6 +115,27 @@ providers:
     assert config.agent.max_parallel_tools == 6
 
 
+def test_memory_is_opt_in_and_project_cannot_enable_it(tmp_path: Path) -> None:
+    base = """
+active_provider: main
+providers:
+  - {name: main, protocol: openai, model: m, base_url: https://x.test, api_key: k}
+"""
+    user = write_config(tmp_path / "user.yaml", base)
+    project = write_config(tmp_path / "project.yaml", "memory: {enabled: true}")
+    config = load_config(user, project, {})
+    assert not config.memory.enabled
+    assert config.memory_warnings
+
+    user.write_text(base + "\nmemory: {enabled: true}\n", encoding="utf-8")
+    project.write_text("memory: {enabled: true}\n", encoding="utf-8")
+    config = load_config(user, project, {})
+    assert config.memory.enabled
+
+    project.write_text("memory: {enabled: false}\n", encoding="utf-8")
+    assert not load_config(user, project, {}).memory.enabled
+
+
 @pytest.mark.parametrize(
     "agent",
     ("{max_iterations: 0}", "{max_iterations: 101}", "{max_parallel_tools: 17}"),

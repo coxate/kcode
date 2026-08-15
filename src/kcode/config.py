@@ -16,6 +16,7 @@ from pydantic import (
     TypeAdapter,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 from kcode.errors import ConfigError
@@ -87,12 +88,47 @@ class AgentConfig(BaseModel):
     max_parallel_tools: int = Field(default=4, ge=1, le=16)
 
 
+class MemoryConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+
+
+class SubAgentConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = True
+    background_enabled: bool = True
+    auto_background_seconds: float = Field(default=120.0, ge=0.1, le=3600.0)
+    max_running: int = Field(default=4, ge=1, le=16)
+    max_retained: int = Field(default=20, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def retained_covers_running(self) -> SubAgentConfig:
+        if self.max_retained < self.max_running:
+            raise ValueError("max_retained must be greater than or equal to max_running")
+        return self
+
+
+class TeamConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = False
+    max_members: int = Field(default=3, ge=1, le=3)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     active_provider: str
     providers: dict[str, ProviderConfig]
     agent: AgentConfig = AgentConfig()
+    memory: MemoryConfig = MemoryConfig()
+    memory_warnings: tuple[str, ...] = ()
+    subagents: SubAgentConfig = SubAgentConfig()
+    subagent_warnings: tuple[str, ...] = ()
+    teams: TeamConfig = TeamConfig()
+    team_warnings: tuple[str, ...] = ()
     mcp_servers: tuple[McpServerConfig, ...] = ()
     mcp_warnings: tuple[str, ...] = ()
 
@@ -101,7 +137,7 @@ class AppConfig(BaseModel):
         return self.providers[self.active_provider]
 
 
-def _read_yaml(path: Path) -> dict[str, Any]:
+def _read_yaml(path: Path, *, source: Literal["user", "project"] = "user") -> dict[str, Any]:
     try:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -141,6 +177,23 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         value["_mcp_warnings"] = [
             f"KCode ignored invalid MCP settings at {path}: 'mcp_servers' must be a mapping."
         ]
+    memory = value.get("memory", {})
+    if not isinstance(memory, dict):
+        raise ConfigError(f"Invalid config {path}, field 'memory': expected a mapping.")
+    subagents = value.get("subagents", {})
+    if not isinstance(subagents, dict):
+        raise ConfigError(f"Invalid config {path}, field 'subagents': expected a mapping.")
+    teams = value.get("teams", {})
+    if not isinstance(teams, dict):
+        if source == "project":
+            value = dict(value)
+            value["teams"] = {}
+            value["_team_warnings"] = [
+                f"KCode ignored invalid project teams settings from {path}; "
+                "configure Agent Teams in ~/.kcode/config.yaml."
+            ]
+        else:
+            raise ConfigError(f"Invalid config {path}, field 'teams': expected a mapping.")
     return value
 
 
@@ -152,7 +205,13 @@ def _merge_configs(
     agent: dict[str, Any] = {}
     mcp_servers: dict[str, tuple[Literal["user", "project"], Any]] = {}
     mcp_warnings: list[str] = []
-    for _, raw, source in configs:
+    memory: dict[str, Any] = {}
+    memory_warnings: list[str] = []
+    subagents: dict[str, Any] = {}
+    subagent_warnings: list[str] = []
+    teams: dict[str, Any] = {}
+    team_warnings: list[str] = []
+    for path, raw, source in configs:
         if "active_provider" in raw:
             active = raw["active_provider"]
         agent.update(raw.get("agent", {}))
@@ -162,10 +221,44 @@ def _merge_configs(
         for name, server in raw.get("mcp_servers", {}).items():
             mcp_servers[name] = (source, server)
         mcp_warnings.extend(raw.get("_mcp_warnings", ()))
+        raw_memory = raw.get("memory", {})
+        if source == "user":
+            memory.update(raw_memory)
+        elif raw_memory.get("enabled") is False:
+            memory["enabled"] = False
+        elif raw_memory.get("enabled") is True and not memory.get("enabled", False):
+            memory_warnings.append(
+                f"KCode ignored memory.enabled: true from project config {path}; "
+                "enable long-term memory in ~/.kcode/config.yaml after reviewing its cost "
+                "and plaintext-storage notice."
+            )
+        raw_subagents = raw.get("subagents", {})
+        if source == "user":
+            subagents.update(raw_subagents)
+        elif raw_subagents:
+            subagent_warnings.append(
+                f"KCode ignored project subagents settings from {path}; "
+                "configure SubAgents in ~/.kcode/config.yaml."
+            )
+        raw_teams = raw.get("teams", {})
+        team_warnings.extend(raw.get("_team_warnings", ()))
+        if source == "user":
+            teams.update(raw_teams)
+        elif "teams" in raw:
+            team_warnings.append(
+                f"KCode ignored project teams settings from {path}; "
+                "enable Agent Teams in ~/.kcode/config.yaml after reviewing parallel Token cost."
+            )
     return {
         "active_provider": active,
         "providers": list(merged.values()),
         "agent": agent,
+        "memory": memory,
+        "memory_warnings": memory_warnings,
+        "subagents": subagents,
+        "subagent_warnings": subagent_warnings,
+        "teams": teams,
+        "team_warnings": team_warnings,
         "mcp_servers": mcp_servers,
         "mcp_warnings": mcp_warnings,
     }
@@ -232,7 +325,7 @@ def load_config(
     loaded: list[tuple[Path, dict[str, Any], Literal["user", "project"]]] = []
     for path in candidates:
         source: Literal["user", "project"] = "project" if path == project_path else "user"
-        loaded.append((path, _read_yaml(path), source))
+        loaded.append((path, _read_yaml(path, source=source), source))
     merged = _merge_configs(loaded)
     source_label = " then ".join(str(path) for path in candidates)
     providers: dict[str, ProviderConfig] = {}
@@ -273,6 +366,12 @@ def load_config(
             active_provider=active,
             providers=providers,
             agent=AgentConfig.model_validate(merged["agent"]),
+            memory=MemoryConfig.model_validate(merged["memory"]),
+            memory_warnings=tuple(merged["memory_warnings"]),
+            subagents=merged["subagents"],
+            subagent_warnings=tuple(merged["subagent_warnings"]),
+            teams=TeamConfig.model_validate(merged["teams"]),
+            team_warnings=tuple(merged["team_warnings"]),
             mcp_servers=tuple(mcp_servers),
             mcp_warnings=tuple(mcp_warnings),
         )

@@ -23,6 +23,7 @@ TOOL_INFO: dict[str, tuple[FriendlyToolName, ToolCategory, str]] = {
     "find_files": ("Glob", ToolCategory.READ, "root"),
     "search_code": ("Grep", ToolCategory.READ, "root"),
     "run_command": ("Bash", ToolCategory.COMMAND, "command"),
+    "load_skill": ("Skill", ToolCategory.READ, "name"),
 }
 
 SIMPLE_READERS = {

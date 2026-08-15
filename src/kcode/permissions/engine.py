@@ -94,6 +94,17 @@ class PermissionEngine:
                     PermissionSource.BLACKLIST,
                     f"KCode blocked a dangerous command: {reason}.",
                 )
+            try:
+                resolve_sandboxed_path(
+                    str(getattr(arguments, "cwd", None) or "."),
+                    context.workspace_root,
+                )
+            except SandboxViolation:
+                return PermissionDecision(
+                    PermissionVerdict.DENY,
+                    PermissionSource.SANDBOX,
+                    "The command cwd is outside the KCode project sandbox.",
+                )
 
         if mode == PermissionMode.PLAN:
             if info.category == ToolCategory.WRITE:

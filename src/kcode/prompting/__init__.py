@@ -3,6 +3,7 @@ from kcode.prompting.environment import EnvironmentCollector, EnvironmentSnapsho
 from kcode.prompting.reminders import (
     build_approved_plan_reminder,
     build_plan_mode_reminder,
+    build_session_resume_reminder,
 )
 from kcode.prompting.sections import DEFAULT_PROMPT_SECTIONS
 
@@ -15,4 +16,5 @@ __all__ = [
     "SystemPromptBuilder",
     "build_approved_plan_reminder",
     "build_plan_mode_reminder",
+    "build_session_resume_reminder",
 ]

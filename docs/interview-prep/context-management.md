@@ -69,7 +69,7 @@ KCode 的每次模型请求都要携带历史消息，长时间执行后，工�
 - `src/kcode/context/compaction.py`：无工具的结构化摘要请求与解析校验。
 - `src/kcode/context/manager.py`：协调外置、预算判断、压缩、恢复段和并发保护。
 - `src/kcode/orchestration.py`：在 Agent 请求组装处接入 ContextSnapshot，并处理紧急重试。
-- `src/kcode/ui/commands.py`、`src/kcode/ui/app.py`：提供 `/compact` 手动命令及结果展示。
+- `src/kcode/commands/`、`src/kcode/ui/app.py`：提供 `/compact` 手动命令及结果展示。
 
 ## 5. 高频面试问答
 

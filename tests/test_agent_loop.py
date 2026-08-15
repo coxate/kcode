@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from kcode.config import AgentConfig
 from kcode.conversation import (
@@ -21,6 +22,9 @@ from kcode.events import (
     ToolFinished,
     UsageReported,
 )
+from kcode.hooks.engine import HookEngine
+from kcode.hooks.models import HookCatalog, HookSource
+from kcode.hooks.parser import parse_hook
 from kcode.orchestration import AgentRunner
 from kcode.permissions import (
     LocalPermissionStore,
@@ -29,6 +33,10 @@ from kcode.permissions import (
     empty_permission_settings,
 )
 from kcode.session import AgentMode, AgentSession
+from kcode.skills.catalog import SkillCatalog
+from kcode.skills.models import SkillDefinition, SkillMeta, SkillSource
+from kcode.skills.runtime import SkillRuntime
+from kcode.skills.tools import LoadSkillTool
 from kcode.tools.base import ToolContext
 from kcode.tools.executor import ToolExecutor
 from kcode.tools.registry import create_default_registry
@@ -84,6 +92,160 @@ def make_runner(tmp_path, provider, *, config=None, conversation=None, environme
         config,
         environment_collector=environment_collector or FakeEnvironmentCollector(),
     )
+
+
+def make_hook(value, order=0):
+    hook, warning = parse_hook(value, HookSource.USER, Path("hooks.yaml"), order)
+    assert warning is None and hook is not None
+    return hook
+
+
+async def test_hook_rejects_before_permission_and_returns_reason_to_model(tmp_path) -> None:
+    provider = ScriptedProvider(
+        [
+            [
+                ToolCallDelta(
+                    0,
+                    "write-1",
+                    "write_file",
+                    '{"path":"protected.txt","content":"unsafe"}',
+                ),
+                StreamCompleted("tool_calls"),
+            ],
+            [TextDelta("used another strategy"), StreamCompleted("stop")],
+        ]
+    )
+    runner = make_runner(tmp_path, provider)
+    engine = HookEngine(
+        HookCatalog(
+            (
+                make_hook(
+                    {
+                        "id": "protect",
+                        "event": "pre_tool_use",
+                        "if": 'args.path == "protected.txt"',
+                        "reject": True,
+                        "reason": "protected path",
+                    }
+                ),
+                make_hook(
+                    {
+                        "id": "observe-denial",
+                        "event": "post_tool_use",
+                        "action": {"type": "prompt", "message": "tool result: $ERROR"},
+                    },
+                    1,
+                ),
+            )
+        )
+    )
+    runner.bind_hooks(engine)
+
+    events = [event async for event in runner.run("write it")]
+
+    assert not (tmp_path / "protected.txt").exists()
+    assert not any(isinstance(event, ApprovalPending) for event in events)
+    result = next(item for item in provider.requests[1][0] if isinstance(item, ToolResultMessage))
+    assert result.result.error is not None
+    assert result.result.error.code == "hook_rejected"
+    assert "protected path" in result.result.error.message
+    reminder = next(
+        item
+        for item in provider.requests[1][0]
+        if isinstance(item, SystemReminderMessage) and item.kind == "hook"
+    )
+    assert "protected path" in reminder.content
+
+
+async def test_hook_prompt_timing_and_turn_end_queue(tmp_path) -> None:
+    provider = ScriptedProvider([[TextDelta("done"), StreamCompleted("stop")]])
+    runner = make_runner(tmp_path, provider)
+    engine = HookEngine(
+        HookCatalog(
+            (
+                make_hook(
+                    {
+                        "id": "before-send",
+                        "event": "pre_send",
+                        "action": {"type": "prompt", "message": "before request"},
+                    }
+                ),
+                make_hook(
+                    {
+                        "id": "after-turn",
+                        "event": "turn_end",
+                        "action": {"type": "prompt", "message": "next turn"},
+                    },
+                    1,
+                ),
+            )
+        )
+    )
+    runner.bind_hooks(engine)
+
+    [event async for event in runner.run("hello")]
+
+    reminder = next(
+        item
+        for item in provider.requests[0][0]
+        if isinstance(item, SystemReminderMessage) and item.kind == "hook"
+    )
+    assert reminder.content == "before request"
+    assert engine.runtime.fallback_session.pending_hook_prompts == ["next turn"]
+
+
+async def test_load_skill_is_visible_in_plan_and_updates_next_iteration_environment(
+    tmp_path,
+) -> None:
+    provider = ScriptedProvider(
+        [
+            [
+                ToolCallDelta(0, "skill-1", "load_skill", '{"name":"review"}'),
+                StreamCompleted("tool_calls"),
+            ],
+            [TextDelta("followed sop"), StreamCompleted("stop")],
+        ]
+    )
+    path = Path("/tmp/review/SKILL.md")
+    runtime = SkillRuntime(
+        SkillCatalog(
+            (
+                SkillDefinition(
+                    SkillMeta(name="review", description="Review code"),
+                    "ACTIVE REVIEW SOP",
+                    SkillSource.BUILTIN,
+                    path,
+                    path.parent.parent,
+                    "digest",
+                ),
+            )
+        )
+    )
+    registry = create_default_registry()
+    registry.register(LoadSkillTool(runtime))
+    settings = empty_permission_settings(tmp_path)
+    runner = AgentRunner(
+        provider,
+        Conversation(),
+        registry,
+        ToolExecutor(
+            registry,
+            PermissionEngine(settings),
+            LocalPermissionStore(settings.layers[0].path),
+        ),
+        ToolContext(tmp_path),
+        allow,
+        environment_collector=FakeEnvironmentCollector(),
+    )
+    runner.bind_skills(runtime)
+    events = [event async for event in runner.run("review this", AgentSession(AgentMode.PLAN))]
+    assert any(isinstance(item, AgentStopped) for item in events)
+    plan_tools = {item.name for item in provider.requests[0][1]}
+    assert "load_skill" in plan_tools
+    second_environment = next(
+        item for item in provider.requests[1][0] if isinstance(item, EnvironmentMessage)
+    )
+    assert "ACTIVE REVIEW SOP" in second_environment.content
 
 
 async def test_agent_loops_three_tools_then_completes(tmp_path) -> None:
@@ -442,3 +604,91 @@ async def test_cooperative_cancel_closes_provider_stream(tmp_path) -> None:
     events = await asyncio.wait_for(task, 1)
     assert provider.closed is True
     assert events[-1].reason == AgentStopReason.CANCELLED
+
+
+class RecordingMemory:
+    def __init__(self) -> None:
+        self.turns = []
+
+    def submit_turn(self, turn):
+        self.turns.append(turn)
+        return True
+
+
+async def test_completed_answer_submits_only_normalized_turn_to_memory(tmp_path) -> None:
+    provider = ScriptedProvider([[TextDelta("remembered"), StreamCompleted()]])
+    runner = make_runner(tmp_path, provider)
+    memory = RecordingMemory()
+    runner.bind_memory(memory)
+    events = [event async for event in runner.run("please remember this")]
+    assert any(
+        isinstance(event, AgentStopped) and event.reason == AgentStopReason.COMPLETED
+        for event in events
+    )
+    assert len(memory.turns) == 1
+    assert memory.turns[0].user_text == "please remember this"
+    assert memory.turns[0].final_text == "remembered"
+
+
+async def test_invalid_answer_does_not_submit_memory_turn(tmp_path) -> None:
+    provider = ScriptedProvider([[StreamCompleted()]])
+    runner = make_runner(tmp_path, provider)
+    memory = RecordingMemory()
+    runner.bind_memory(memory)
+    events = [event async for event in runner.run("remember")]
+    assert events[-1].reason == AgentStopReason.INVALID_RESPONSE
+    assert memory.turns == []
+
+
+async def test_task_notification_is_consumed_once_without_entering_history(tmp_path) -> None:
+    class Notifications:
+        def __init__(self):
+            self.values = ("<task-notification>done</task-notification>",)
+
+        def take_notifications(self):
+            values = self.values
+            self.values = ()
+            return values
+
+    conversation = Conversation()
+    provider = ScriptedProvider([[TextDelta("acknowledged"), StreamCompleted("stop")]])
+    runner = make_runner(tmp_path, provider, conversation=conversation)
+    source = Notifications()
+    runner.bind_task_notifications(source)
+    [event async for event in runner.run("continue")]
+    reminder = next(
+        item
+        for item in provider.requests[0][0]
+        if isinstance(item, SystemReminderMessage) and item.kind == "task"
+    )
+    assert "task-notification" in reminder.content
+    assert source.values == ()
+    assert "task-notification" not in repr(conversation.messages_snapshot())
+
+
+async def test_team_message_is_consumed_before_model_without_entering_history(tmp_path) -> None:
+    class Messages:
+        def __init__(self):
+            self.values = ("<team-messages>coordinate</team-messages>",)
+
+        def take_team_messages(self):
+            values = self.values
+            self.values = ()
+            return values
+
+    conversation = Conversation()
+    provider = ScriptedProvider([[TextDelta("acknowledged"), StreamCompleted("stop")]])
+    runner = make_runner(tmp_path, provider, conversation=conversation)
+    source = Messages()
+    runner.bind_team_messages(source)
+
+    [event async for event in runner.run("continue")]
+
+    reminder = next(
+        item
+        for item in provider.requests[0][0]
+        if isinstance(item, SystemReminderMessage) and item.kind == "team"
+    )
+    assert "coordinate" in reminder.content
+    assert source.values == ()
+    assert "team-messages" not in repr(conversation.messages_snapshot())

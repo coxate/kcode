@@ -2,7 +2,7 @@
 
 KCode 是一个 Python 全屏终端 AI 编程助手。它提供流式 Markdown、多轮会话、ReAct Agent Loop、Plan Mode、Claude extended thinking，以及 Anthropic、OpenAI 和 DeepSeek 三种配置方式。
 
-0.4.0 内置六个工具和分层权限系统：读取文件、新建文件、唯一匹配修改文件、执行命令、按 glob 查找文件和按正则搜索代码。模型可以在一次请求中连续调用多轮工具；相邻只读工具有界并发，有副作用的工具按顺序串行。
+0.8.0 在 SubAgent 基础上新增 Git Worktree 文件系统隔离与单进程 Agent Team MVP。多个命名成员可以在独立 Conversation 和 Worktree 中协作，通过共享任务板与点对点消息同步；KCode 不会自动提交或合并成果。
 
 每次请求默认最多运行 10 个模型轮次。模型正常完成、达到迭代上限、用户取消、连续请求未知工具或模型流出错时，界面都会显示明确的停止原因。
 
@@ -57,6 +57,25 @@ providers:
     context_window: 64000
 ```
 
+长期记忆默认关闭。它会增加模型调用，并把确认后的知识保存为本地明文 Markdown；阅读风险说明后，只能在用户级 `~/.kcode/config.yaml` 显式开启：
+
+```yaml
+memory:
+  enabled: true
+```
+
+项目配置可以关闭长期记忆，但不能替用户开启。
+
+Agent Team 默认关闭。它会让多个成员并行调用模型，成员从 idle 被消息续派时也会产生新的 Token 费用；阅读费用和隔离说明后，只能在用户级配置显式开启：
+
+```yaml
+teams:
+  enabled: true
+  max_members: 3
+```
+
+项目配置中的 `teams` 会被整段忽略并显示 warning，不能替用户开启或提高上限。
+
 DeepSeek 使用 OpenAI 兼容协议，因此 `protocol` 保持为 `openai`。Claude 的 `thinking: true` 会开启独立 thinking 区域；该设置对 OpenAI/DeepSeek 会被忽略并显示提示。
 `context_window` 是可选的模型上下文窗口覆盖值；未配置时 KCode 会优先使用已知模型元数据，再使用保守默认值并降低预算估算置信度。
 
@@ -80,7 +99,102 @@ uv run kcode
 uv run python -m kcode
 ```
 
-命令：`/plan`、`/do`、`/help`、`/clear`、`/exit`。Shift+Tab 循环切换四档权限模式。模型生成时按 Ctrl+C 只取消当前任务；空闲时按 Ctrl+C 退出。
+输入 `/help` 可查看 16 条内置命令。输入 `/` 开头的正式命令前缀时会显示补全菜单：Up/Down 选择、Tab 补全、Enter 执行、ESC 关闭。Shift+Tab 循环切换四档权限模式，Ctrl+M 打开长期记忆面板。模型生成时按 Ctrl+C 只取消当前任务；空闲时按 Ctrl+C 退出。
+
+## Git Worktree 隔离
+
+Worktree 功能要求 KCode 从一个非 bare Git 工作树内启动。它为同一仓库创建独立目录与分支，但不会改变主 Agent 的工作目录。默认位置是：
+
+```text
+<仓库父目录>/.kcode-worktrees/<仓库名>/<slug>
+```
+
+手动管理命令：
+
+```text
+/worktree create <slug>
+/worktree list
+/worktree status <slug>
+/worktree remove <slug>
+```
+
+- 名称只能是最长 64 字符的单段小写 slug，例如 `api-review`。
+- 手动创建允许主目录有未提交修改，但副本只包含当前 `HEAD`，KCode 会明确警告。
+- `remove` 仅删除可证明“没有未提交修改且没有基线后 commit”的托管 Worktree，不使用强制删除，也不删除对应分支或有成果的目录。
+- KCode 不提供 `enter/exit`，不会自动提交、合并、cherry-pick、复制 `.env` 或链接依赖目录。
+
+定义式 SubAgent 可以在 Markdown frontmatter 中选择隔离：
+
+```yaml
+isolation: worktree
+```
+
+未配置时默认 `shared`，保持旧角色行为。自动隔离要求主目录完全干净；否则任务在创建副本前拒绝，避免子 Agent 看不到主目录的未提交改动。隔离 Agent 的文件、搜索、命令 cwd、环境信息和权限沙箱都以副本为根，不能访问主目录或其他 Worktree。
+
+任务结束时，KCode 会报告路径、分支、基线、当前 HEAD、dirty 状态和保留原因。无成果副本会用普通 Git 命令安全清理；存在文件修改、新 commit 或任何无法确认的 Git 状态时一律保留。可以使用报告中的路径和分支人工 review；KCode 不会自动合并成果。
+
+非 Git 项目仍可使用普通 `shared` SubAgent；Worktree 命令或 `isolation: worktree` 会返回明确的不可用错误，不会阻止 KCode 启动。
+
+## Agent Team MVP
+
+Agent Team 只存在于当前 KCode 进程：同一时刻只有一个 Team，最多三个命名成员。KCode 重启后不会恢复 Team、任务板或邮箱；有成果的 Worktree 和分支仍保留，可以通过报告中的路径继续 review。
+
+主 Agent 始终注册九个稳定工具：`team_create`、`team_spawn`、`team_status`、`team_stop`、`team_delete`、`team_send_message`、`team_task_create`、`team_task_list`、`team_task_update`。关闭 Team 时它们返回 `teams_disabled`，不会启动模型或创建 Worktree。
+
+用户可在界面直接干预：
+
+```text
+/team status
+/team stop <member>
+/team delete
+```
+
+- 成员默认使用独立 Worktree。主目录必须干净；非 Git 或只读场景只能显式选择 `shared`，并承担并发写冲突风险。
+- 成员自然完成后进入 idle，保留原 Conversation 和 Worktree；新消息可沿用原上下文续派并产生模型费用。
+- 成员可以单播、广播、向 Lead 发消息，并共享带负责人、状态和无环依赖的任务板。
+- Lead 空闲时收到的消息只保留到下一次用户请求，不自动唤醒模型或产生费用。
+- stop、delete 和退出只清理可证明没有成果的临时 Worktree；修改、新 commit 或 Git 状态未知时一律保留。
+- Team 不自动 commit、merge、cherry-pick、rebase 或解决冲突。人工收敛前应先 review 报告路径，并确认主目录干净。
+
+最小安全流程是：在用户配置开启 Team → 让 Lead 调用 `team_create` 和 `team_spawn` → 用 `/team status` 观察 → 用 `/team stop <member>` 停止成员 → review 保留路径 → 所有成员停止后 `/team delete`。关闭 Team 配置是可撤销的；模型费用和已经写入 Worktree 的成果不会因关闭配置自动撤销或删除。
+
+## 项目指令
+
+KCode 启动时加载以下三个文件，后者优先级更高：
+
+1. 用户级：`~/.kcode/KCODE.md`
+2. 项目级：`<当前工作目录>/KCODE.md`
+3. 本机项目级：`<当前工作目录>/.kcode/KCODE.md`
+
+独占一行的 `@include <relative-path>` 可以拆分规则文件。include 受到真实路径边界、符号链接、五层深度、环路检测和 32 KiB 总预算保护。用户级 include 不能离开 `~/.kcode/`，两个项目级来源不能离开项目根。加载失败会显示警告，不会把错误文字混进 Prompt；运行期间修改规则要重启后才生效。
+
+不要在 `KCODE.md` 中存放 API Key、访问令牌或其他秘密。项目级文件通常可以提交共享，本机项目级文件适合只在当前机器生效的规则。
+
+## 会话存档与恢复
+
+- 完成的用户、助手和工具消息以 versioned JSONL 追加到 `.kcode/sessions/<session-id>/conversation.jsonl`。
+- 输入 `/resume` 可以按标题、模型或 session ID 搜索历史会话。恢复使用当前 Provider 和模型；模型不同时会提示，但不会自动切换。
+- 恢复后的首轮请求会提醒 Agent 重新核实可能过期的文件和外部状态。该提醒和上下文压缩摘要都不会写回原始日志。
+- 列表、搜索和预算内恢复完全在本地完成。如果历史超过当前上下文预算，KCode 会在切换前调用当前 Provider 生成压缩视图；这可能产生模型 Token 费用，失败时保留原会话，原始 JSONL 不变。
+- 输入 `/clear` 会关闭并保留当前存档，然后创建新的空白 session；它不会删除旧会话。
+- 旧格式 session ID 和只有 `tool-results` 的目录不会展示、迁移或删除。
+
+会话文件是当前机器上的**明文文件**。KCode 会收紧支持平台上的文件权限、默认 Git 忽略 `.kcode/sessions/`，并对已加载的 API Key 做精确值脱敏；但它不能识别任意秘密，用户输入、文件内容和工具结果仍可能被保存。会话存档不提供加密、自动删除或云同步。
+
+## 长期记忆
+
+会话历史回答“以前具体聊过什么”，长期记忆回答“哪些经过确认的知识以后仍应使用”。上下文压缩摘要只服务当前会话，`KCODE.md` 则是人主动发布、适合团队共享的明确规范。
+
+- 成功回答后，KCode 先用本地规则寻找偏好、纠正、项目决定和参考资料信号；没有信号时不会额外调用模型。
+- 命中后，当前 Provider/模型只接收本轮用户文本、最终回答和精炼记忆索引，生成最多三条候选。
+- 候选不会自动生效。界面空闲后可确认、编辑后确认或拒绝；新建、更新、合并和失效都需要确认。
+- Ctrl+M 可以查看待审、活跃和已失效记忆，编辑内容、失效/恢复记录，以及二次确认后永久删除。
+- 用户偏好默认保存在 `~/.kcode/memory/`；纠正、项目事实和参考资料默认保存在 `<项目>/.kcode/memory/`。
+- 项目自动记忆默认 Git 忽略。稳定且需要团队共享的规则应由人整理进 `KCODE.md`。
+- 活跃记忆以精炼索引注入 `long_term_memory`，受 24 KiB/200 行预算保护；二期不包含向量检索或 RAG。
+- 至少十条活跃记忆、间隔二十四小时且新增五个完成会话后，KCode 才会提出重复、冲突或过期治理建议。它永不自动删除。
+
+记忆文件同样是本地**明文文件**。KCode 会收紧权限、对已加载的敏感值精确脱敏并阻止若干常见密钥形态，但不能识别任意秘密。不要要求 KCode 记住密码、API Key、令牌或私钥。提取和治理会产生额外模型 Token 费用；设置 `memory.enabled: false` 即可关闭。
 
 ## Agent Loop 与 Plan Mode
 
@@ -89,7 +203,7 @@ uv run python -m kcode
 - 在 Plan Mode 中输入任务，KCode 会自主调查并保存最终计划。
 - 输入 `/do` 切回执行模式。保存的计划只注入下一条普通请求一次，随后自动清除。
 - Shift+Tab 离开 plan 会保留计划但不会批准；只有 `/do` 会批准计划。
-- 输入 `/clear` 会同时清除对话、计划并恢复启动默认模式。
+- 输入 `/clear` 会保留旧会话存档，同时清空当前界面、上下文和计划，并恢复启动默认模式。
 
 底部状态栏显示当前权限模式、模型、轮次和本次请求累计 Token。供应商没有返回用量或流提前中断时显示 `Token ?`，不会把未知用量误记为零。
 

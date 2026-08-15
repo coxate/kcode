@@ -22,6 +22,15 @@ def test_builder_sorts_sections_skips_empty_and_is_stable() -> None:
     assert builder.build().encode() == builder.build().encode()
 
 
+def test_builder_with_content_is_immutable() -> None:
+    original = SystemPromptBuilder(DEFAULT_PROMPT_SECTIONS)
+    customized = original.with_content("custom_instructions", "project rule")
+    assert "project rule" not in original.build()
+    assert "project rule" in customized.build()
+    with pytest.raises(KeyError):
+        original.with_content("missing", "x")
+
+
 @pytest.mark.parametrize(
     "sections",
     [
@@ -39,7 +48,7 @@ def test_default_sections_have_fixed_order_slots_and_key_rules() -> None:
     assert [section.priority for section in DEFAULT_PROMPT_SECTIONS] == list(range(1000, 0, -100))
     assert [section.name for section in DEFAULT_PROMPT_SECTIONS[-3:]] == [
         "custom_instructions",
-        "active_skills",
+        "available_skills",
         "long_term_memory",
     ]
     assert all(not section.content for section in DEFAULT_PROMPT_SECTIONS[-3:])

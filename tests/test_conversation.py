@@ -1,11 +1,35 @@
+import pytest
+
 from kcode.conversation import (
     AssistantMessage,
     ChatMessage,
+    ChatTurn,
     Conversation,
+    StableSystemMessage,
     ToolResultMessage,
     UserMessage,
 )
 from kcode.tools.base import ToolCall, ToolResult
+
+
+def test_restore_rebuilds_turns_and_rejects_active_or_noncanonical_history() -> None:
+    conversation = Conversation()
+    messages = (
+        UserMessage("question"),
+        AssistantMessage("", (ToolCall(0, "call", "read_file", "{}"),)),
+        ToolResultMessage("call", "read_file", ToolResult.success({"content": "x"})),
+        AssistantMessage("answer"),
+    )
+    conversation.restore(messages)
+    assert conversation.messages_snapshot() == messages
+    assert conversation.snapshot() == (ChatTurn("question", "answer"),)
+
+    handle = conversation.begin_turn("next")
+    with pytest.raises(RuntimeError):
+        conversation.restore(messages)
+    conversation.stop_turn(handle)
+    with pytest.raises(ValueError):
+        conversation.restore((StableSystemMessage("system"),))
 
 
 def test_only_committed_turns_appear_in_request() -> None:

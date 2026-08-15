@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import secrets
-import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +27,7 @@ from kcode.context.models import (
 from kcode.context.usage import UsageEstimator, normalize_usage, resolve_context_window
 from kcode.conversation import ConversationMessage, SystemMessage
 from kcode.events import TokenUsage
+from kcode.history.ids import create_session_id
 from kcode.providers.base import ChatProvider
 from kcode.tools.base import ToolDefinition
 
@@ -40,10 +39,6 @@ RECENT_MESSAGES = 5
 AUTOMATIC_FAILURE_LIMIT = 3
 FILE_SNAPSHOT_LIMIT = 5
 FILE_SNAPSHOT_CHARACTERS = 17_500
-
-
-def create_session_id() -> str:
-    return f"{int(time.time())}-{secrets.token_hex(4)}"
 
 
 def _fingerprint(messages: Sequence[ConversationMessage]) -> str:
@@ -116,6 +111,7 @@ class ContextManager:
         force_compaction: bool = False,
         reason: CompactionReason = "automatic",
         apply_offload: bool = True,
+        focus: str | None = None,
     ) -> ContextSnapshot:
         async with self._lock:
             canonical = tuple(canonical_messages)
@@ -145,7 +141,7 @@ class ContextManager:
             )
             result: CompactionResult | None = None
             if should_attempt:
-                result = await self._compact_locked(model_messages, tool_tuple, reason)
+                result = await self._compact_locked(model_messages, tool_tuple, reason, focus=focus)
                 if result.success:
                     if reason == "automatic":
                         self._automatic_failures = 0
@@ -182,6 +178,7 @@ class ContextManager:
         tools: Sequence[ToolDefinition] = (),
         *,
         prefix_messages: Sequence[ConversationMessage] = (),
+        focus: str | None = None,
     ) -> ContextSnapshot:
         return await self.build_snapshot(
             canonical_messages,
@@ -190,6 +187,7 @@ class ContextManager:
             force_compaction=True,
             reason="manual",
             apply_offload=False,
+            focus=focus,
         )
 
     async def emergency_snapshot(
@@ -278,6 +276,8 @@ class ContextManager:
         messages: tuple[ConversationMessage, ...],
         tools: tuple[ToolDefinition, ...],
         reason: CompactionReason,
+        *,
+        focus: str | None = None,
     ) -> CompactionResult:
         if self.compaction_engine is None:
             return CompactionResult(
@@ -303,7 +303,11 @@ class ContextManager:
         if not summary_messages:
             summary_messages = messages
             summary_end = len(messages)
-        result = await self.compaction_engine.compact(summary_messages, source_start=0)
+        result = await self.compaction_engine.compact(
+            summary_messages,
+            source_start=0,
+            focus=focus,
+        )
         if not result.success or result.summary is None or result.rendered_summary is None:
             return result
         self._state = CompactionState(

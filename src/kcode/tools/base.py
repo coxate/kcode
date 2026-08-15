@@ -161,6 +161,8 @@ class ApprovalRequest:
     preview: str
     reason: str
     permanent_rule: str
+    source_label: str | None = None
+    task_id: str | None = None
 
 
 ApprovalHandler: TypeAlias = Callable[[ApprovalRequest], Awaitable["ApprovalChoice"]]
@@ -173,6 +175,8 @@ class ToolSpec:
     arguments_model: type[ToolArguments]
     effect: ToolEffect | None = ToolEffect.READ_ONLY
     parameters: Mapping[str, Any] | None = None
+    always_visible: bool = False
+    self_managed_timeout: bool = False
 
 
 class Tool(Protocol):
@@ -189,6 +193,15 @@ class PreparedToolCall:
     arguments: ToolArguments | None
     effect: ToolEffect
     approval: ApprovalRequest | None = None
+    error: ToolResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedToolCall:
+    call: ToolCall
+    tool: Tool | None
+    arguments: ToolArguments | None
+    declared_effect: ToolEffect
     error: ToolResult | None = None
 
 

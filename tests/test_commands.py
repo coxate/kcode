@@ -1,13 +1,319 @@
-from kcode.ui.commands import CommandKind, parse_command
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import pytest
+
+from kcode.commands import (
+    ArgumentPolicy,
+    CommandDispatcher,
+    CommandRegistrationError,
+    CommandRegistry,
+    CommandSpec,
+    CommandType,
+    MemoryInventory,
+    SessionInfo,
+    StatusSnapshot,
+    create_builtin_registry,
+    register_skill_commands,
+)
+from kcode.hooks.models import HookEvent, HookSource, HookSummary
+from kcode.skills.models import SkillSummary
 
 
-def test_local_commands_and_plain_text() -> None:
-    assert parse_command("question") is None
-    assert parse_command(" /HELP ").kind == CommandKind.HELP
-    assert parse_command("/clear").kind == CommandKind.CLEAR
-    assert parse_command("/exit").kind == CommandKind.EXIT
-    assert parse_command("/plan").kind == CommandKind.PLAN
-    assert parse_command("/do").kind == CommandKind.DO
-    assert parse_command("/compact").kind == CommandKind.COMPACT
-    assert parse_command(" /MCP   TRUST clear ").kind == CommandKind.MCP_TRUST_CLEAR
-    assert parse_command("/nope").kind == CommandKind.UNKNOWN
+@dataclass
+class FakeHost:
+    notices: list[tuple[str, str]] = field(default_factory=list)
+    submitted: list[str] = field(default_factory=list)
+    mode: str = "default"
+    compact_focus: str | None = None
+    executed_skills: list[tuple[str, str]] = field(default_factory=list)
+    hook_commands: list[tuple[str, str, CommandType]] = field(default_factory=list)
+    worktree_commands: list[tuple[str, str | None]] = field(default_factory=list)
+    team_commands: list[tuple[str, str | None]] = field(default_factory=list)
+
+    async def command_notice(self, text: str, style: str = "system") -> None:
+        self.notices.append((text, style))
+
+    async def command_submit_user(self, text: str, display_text: str | None = None) -> None:
+        self.submitted.append(text)
+
+    def command_skills(self) -> tuple[SkillSummary, ...]:
+        return (SkillSummary("review", "Review code"),)
+
+    async def command_execute_skill(self, name: str, args: str) -> None:
+        self.executed_skills.append((name, args))
+
+    def command_hooks(self) -> tuple[HookSummary, ...]:
+        return (
+            HookSummary(
+                "protect",
+                HookEvent.PRE_TOOL_USE,
+                "reject",
+                True,
+                False,
+                True,
+                HookSource.PROJECT,
+            ),
+        )
+
+    async def command_hook_execute(self, name: str, args: str, command_type: CommandType) -> None:
+        self.hook_commands.append((name, args, command_type))
+
+    async def command_hook_error(self, name: str, error_type: str) -> None:
+        return None
+
+    def command_enter_plan(self) -> None:
+        self.mode = "plan"
+
+    def command_enter_do(self) -> bool:
+        self.mode = "default"
+        return False
+
+    async def command_compact(self, focus: str | None) -> None:
+        self.compact_focus = focus
+
+    async def command_clear(self) -> None:
+        return None
+
+    def command_resume(self) -> None:
+        return None
+
+    async def command_exit(self) -> None:
+        return None
+
+    async def command_clear_mcp_trust(self) -> None:
+        return None
+
+    def command_status(self) -> StatusSnapshot:
+        return StatusSnapshot(self.mode, 2, 3, 4, None, "test-model", "/tmp/project")
+
+    def command_memories(self) -> MemoryInventory:
+        return MemoryInventory(False)
+
+    def command_session(self) -> SessionInfo:
+        return SessionInfo(False)
+
+    async def command_worktree_create(self, name: str) -> None:
+        self.worktree_commands.append(("create", name))
+
+    async def command_worktree_list(self) -> None:
+        self.worktree_commands.append(("list", None))
+
+    async def command_worktree_status(self, name: str) -> None:
+        self.worktree_commands.append(("status", name))
+
+    async def command_worktree_remove(self, name: str) -> None:
+        self.worktree_commands.append(("remove", name))
+
+    async def command_team_status(self) -> None:
+        self.team_commands.append(("status", None))
+
+    async def command_team_stop(self, name: str) -> None:
+        self.team_commands.append(("stop", name))
+
+    async def command_team_delete(self) -> None:
+        self.team_commands.append(("delete", None))
+
+
+def test_parse_plain_slash_case_and_original_arguments() -> None:
+    registry = create_builtin_registry()
+
+    assert registry.parse("question") is None
+    assert registry.parse("  ") is None
+    assert registry.parse("/").name == "help"
+    parsed = registry.parse(" /PLAN   保留  内部格式  ")
+    assert parsed is not None
+    assert parsed.name == "plan"
+    assert parsed.args == "保留  内部格式"
+
+
+def test_builtin_commands_aliases_and_candidates() -> None:
+    registry = create_builtin_registry()
+
+    assert len(registry.visible_commands()) == 16
+    assert registry.resolve("H").name == "help"
+    assert registry.resolve("?").name == "help"
+    assert registry.resolve("C").name == "compact"
+    assert registry.resolve("P").name == "plan"
+    assert registry.resolve("S").name == "status"
+    assert [command.name for command in registry.candidates("s")] == [
+        "session",
+        "skill",
+        "status",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hooks_command_lists_only_safe_summary_and_emits_command_event() -> None:
+    registry = create_builtin_registry()
+    host = FakeHost()
+    await CommandDispatcher(registry).dispatch("/hooks", host)
+    text = host.notices[-1][0]
+    assert "protect" in text
+    assert "pre_tool_use" in text
+    assert "reject" in text
+    assert host.hook_commands == [("hooks", "", CommandType.LOCAL)]
+
+
+def test_registration_rejects_name_alias_and_case_conflicts() -> None:
+    async def handler(_context) -> None:
+        return None
+
+    registry = CommandRegistry()
+    registry.register(
+        CommandSpec(
+            "alpha",
+            ("a",),
+            "alpha",
+            "/alpha",
+            CommandType.LOCAL,
+            ArgumentPolicy.NONE,
+            handler,
+        )
+    )
+    with pytest.raises(CommandRegistrationError, match="a"):
+        registry.register(
+            CommandSpec(
+                "A",
+                (),
+                "conflict",
+                "/A",
+                CommandType.LOCAL,
+                ArgumentPolicy.NONE,
+                handler,
+            )
+        )
+    with pytest.raises(CommandRegistrationError, match="invalid"):
+        CommandRegistry().register(
+            CommandSpec(
+                "bad/name",
+                (),
+                "bad",
+                "/bad/name",
+                CommandType.LOCAL,
+                ArgumentPolicy.NONE,
+                handler,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_unknown_usage_plan_skill_and_compact() -> None:
+    registry = create_builtin_registry()
+    dispatcher = CommandDispatcher(registry)
+    host = FakeHost()
+
+    assert not await dispatcher.dispatch("ordinary text", host)
+    assert await dispatcher.dispatch("/nope", host)
+    assert "未知命令" in host.notices[-1][0]
+    await dispatcher.dispatch("/status extra", host)
+    assert host.notices[-1] == ("用法：/status", "error")
+    await dispatcher.dispatch("/plan 设计  注册器", host)
+    assert host.mode == "plan"
+    assert host.submitted[-1] == "设计  注册器"
+    await dispatcher.dispatch("/skill", host)
+    assert "/review — Review code" in host.notices[-1][0]
+    await dispatcher.dispatch("/compact 只保留 API", host)
+    assert host.compact_focus == "只保留 API"
+
+
+@pytest.mark.asyncio
+async def test_help_is_sorted_and_old_mcp_syntax_is_unknown() -> None:
+    registry = create_builtin_registry()
+    dispatcher = CommandDispatcher(registry)
+    host = FakeHost()
+
+    await dispatcher.dispatch("/", host)
+    lines = host.notices[-1][0].splitlines()[1:]
+    assert lines == sorted(lines)
+    assert len(lines) == 16
+
+
+@pytest.mark.asyncio
+async def test_team_command_dispatches_strict_subcommands() -> None:
+    registry = create_builtin_registry()
+    host = FakeHost()
+    dispatcher = CommandDispatcher(registry)
+    await dispatcher.dispatch("/team status", host)
+    await dispatcher.dispatch("/team stop alice", host)
+    await dispatcher.dispatch("/team delete", host)
+    assert host.team_commands == [("status", None), ("stop", "alice"), ("delete", None)]
+    await dispatcher.dispatch("/team stop", host)
+    assert host.notices[-1] == ("用法：/team status|stop <member>|delete", "error")
+    await dispatcher.dispatch("/help s", host)
+    assert "名称：/status" in host.notices[-1][0]
+    await dispatcher.dispatch("/mcp trust clear", host)
+    assert "未知命令：/mcp" in host.notices[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_worktree_command_parses_subcommands_strictly() -> None:
+    registry = create_builtin_registry()
+    dispatcher = CommandDispatcher(registry)
+    host = FakeHost()
+    for command in (
+        "/worktree create demo",
+        "/worktree list",
+        "/worktree status demo",
+        "/worktree remove demo",
+    ):
+        await dispatcher.dispatch(command, host)
+    assert host.worktree_commands == [
+        ("create", "demo"),
+        ("list", None),
+        ("status", "demo"),
+        ("remove", "demo"),
+    ]
+    await dispatcher.dispatch("/worktree list extra", host)
+    assert host.notices[-1][1] == "error"
+    await dispatcher.dispatch("/help worktree", host)
+    assert "create|list|status|remove" in host.notices[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_argument_limit_and_handler_errors_become_notices() -> None:
+    async def broken(_context) -> None:
+        raise RuntimeError("secret details")
+
+    registry = CommandRegistry()
+    registry.register(
+        CommandSpec(
+            "broken",
+            (),
+            "broken",
+            "/broken [参数]",
+            CommandType.ACTION,
+            ArgumentPolicy.OPTIONAL,
+            broken,
+        )
+    )
+    registry.freeze()
+    host = FakeHost()
+    dispatcher = CommandDispatcher(registry)
+
+    await dispatcher.dispatch("/broken " + "x" * 2001, host)
+    assert "2000" in host.notices[-1][0]
+    await dispatcher.dispatch("/broken", host)
+    assert host.notices[-1][0] == "命令 /broken 执行失败：RuntimeError。"
+
+
+@pytest.mark.asyncio
+async def test_delayed_freeze_registers_dynamic_skills() -> None:
+    registry = create_builtin_registry(freeze=False)
+    assert not registry.frozen
+    register_skill_commands(
+        registry,
+        (
+            SkillSummary("commit", "Commit changes"),
+            SkillSummary("review", "Review code"),
+            SkillSummary("test", "Run tests"),
+        ),
+    )
+    registry.freeze()
+    registry.freeze()
+    assert registry.frozen
+    assert len(registry.visible_commands()) == 19
+    host = FakeHost()
+    assert await CommandDispatcher(registry).dispatch("/review 并发 安全", host)
+    assert host.executed_skills == [("review", "并发 安全")]

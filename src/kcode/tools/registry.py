@@ -34,6 +34,19 @@ class ToolRegistry:
     def __len__(self) -> int:
         return len(self._tools)
 
+    def names(self) -> set[str]:
+        return set(self._tools)
+
+    def tools(self) -> tuple[Tool, ...]:
+        return tuple(self._tools.values())
+
+    def restricted_view(self, names: set[str]) -> ToolRegistry:
+        view = ToolRegistry()
+        for name, tool in self._tools.items():
+            if name in names or tool.spec.always_visible:
+                view.register(tool)
+        return view
+
     def names_with_effect(self, effect: ToolEffect) -> set[str]:
         return {tool.spec.name for tool in self._tools.values() if tool.spec.effect == effect}
 

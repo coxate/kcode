@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
+from kcode.matching import glob_regex
 from kcode.permissions.models import (
     FriendlyToolName,
     PermissionLayer,
@@ -39,34 +40,26 @@ def parse_rules(values: Iterable[str]) -> tuple[PermissionRule, ...]:
     return tuple(parse_rule(value) for value in values)
 
 
-def _glob_regex(pattern: str, *, path: bool) -> re.Pattern[str]:
-    output = ["^"]
-    index = 0
-    while index < len(pattern):
-        character = pattern[index]
-        if character == "*":
-            if index + 1 < len(pattern) and pattern[index + 1] == "*":
-                output.append(".*")
-                index += 2
-                continue
-            output.append("[^/]*" if path else ".*")
-        else:
-            output.append(re.escape(character))
-        index += 1
-    output.append("$")
-    return re.compile("".join(output))
-
-
 def rule_matches(rule: PermissionRule, tool_name: FriendlyToolName, value: str) -> bool:
     if rule.tool_name.startswith("mcp__"):
-        return _glob_regex(rule.tool_name, path=False).fullmatch(tool_name) is not None
+        return (
+            glob_regex(rule.tool_name, path=False, question_mark=False).fullmatch(tool_name)
+            is not None
+        )
     if rule.tool_name != tool_name:
         return False
     if rule.pattern is None:
         return True
     if "*" not in rule.pattern:
         return value == rule.pattern
-    return _glob_regex(rule.pattern, path=tool_name != "Bash").fullmatch(value) is not None
+    return (
+        glob_regex(
+            rule.pattern,
+            path=tool_name != "Bash",
+            question_mark=False,
+        ).fullmatch(value)
+        is not None
+    )
 
 
 def match_layers(

@@ -8,4 +8,6 @@ __pycache__/
 !.env.example
 .kcode/config.yaml
 .kcode/permissions.local.yaml
+.kcode/sessions/
+.kcode/memory/
 .DS_Store

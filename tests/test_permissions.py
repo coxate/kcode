@@ -96,6 +96,22 @@ def test_every_file_tool_is_sandboxed(tmp_path, tool_name, arguments) -> None:
     assert decision.verdict == PermissionVerdict.DENY
 
 
+def test_run_command_cwd_is_sandboxed(tmp_path: Path) -> None:
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    outside = tmp_path / "parent"
+    outside.mkdir()
+    engine = _engine(workspace)
+    decision = engine.evaluate(
+        ToolCall(0, "call", "run_command", "{}"),
+        RunCommandArgs(command="pwd", cwd=str(outside)),
+        ToolContext(workspace),
+        PermissionMode.BYPASS_PERMISSIONS,
+    )
+    assert decision.source == PermissionSource.SANDBOX
+    assert decision.verdict == PermissionVerdict.DENY
+
+
 def test_rule_parser_and_globs() -> None:
     assert parse_rule("Bash").pattern is None
     assert rule_matches(parse_rule("Bash(git *)"), "Bash", "git status")
@@ -103,6 +119,7 @@ def test_rule_parser_and_globs() -> None:
     assert rule_matches(parse_rule("Write(src/**)"), "Write", "src/a/b.py")
     assert not rule_matches(parse_rule("Write(src/*)"), "Write", "src/a/b.py")
     assert rule_matches(parse_rule("Write(file?.txt)"), "Write", "file?.txt")
+    assert not rule_matches(parse_rule("Write(file?*.txt)"), "Write", "file-a.txt")
     with pytest.raises(ValueError):
         parse_rule("Shell(git status)")
     with pytest.raises(ValueError):
